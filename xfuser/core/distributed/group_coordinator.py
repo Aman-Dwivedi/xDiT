@@ -585,7 +585,8 @@ class GroupCoordinator:
         if dst is None:
             dst = self.group_next_rank
 
-        torch.distributed.send(
+        uccl_comm = get_uccl_comm()
+        uccl_comm.send(
             tensor,
             self.ranks[dst],
             group=(
@@ -604,7 +605,8 @@ class GroupCoordinator:
             src = self.group_prev_rank
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        torch.distributed.recv(
+        uccl_comm = get_uccl_comm()
+        uccl_comm.recv(
             tensor,
             self.ranks[src],
             (
@@ -961,7 +963,8 @@ class PipelineGroupCoordinator(GroupCoordinator):
         return self.recv_buffer[name][idx]
 
     def _pipeline_irecv(self, tensor: torch.tensor):
-        return torch.distributed.irecv(
+        uccl_comm = get_uccl_comm()
+        return uccl_comm.irecv(
             tensor,
             src=self.prev_rank,
             group=(
@@ -972,7 +975,8 @@ class PipelineGroupCoordinator(GroupCoordinator):
         )
 
     def _pipeline_isend(self, tensor: torch.tensor):
-        return torch.distributed.isend(
+        uccl_comm = get_uccl_comm()
+        return uccl_comm.isend(
             tensor,
             dst=self.next_rank,
             group=(
@@ -1037,12 +1041,14 @@ class PipelineGroupCoordinator(GroupCoordinator):
             )
 
     def _pipeline_irecv_skip(self, tensor: torch.tensor):
-        return torch.distributed.irecv(
+        uccl_comm = get_uccl_comm()
+        return uccl_comm.irecv(
             tensor, src=self.skip_rank, group=self.skip_device_group
         )
 
     def _pipeline_isend_skip(self, tensor: torch.tensor):
-        return torch.distributed.isend(
+        uccl_comm = get_uccl_comm()
+        return uccl_comm.isend(
             tensor, dst=self.skip_rank, group=self.skip_device_group
         )
 
