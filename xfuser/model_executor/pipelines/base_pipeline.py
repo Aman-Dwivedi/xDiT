@@ -34,6 +34,7 @@ from xfuser.core.distributed import (
     get_vae_parallel_group,
     get_dit_group,
 )
+from xfuser.core.distributed.uccl_comm import get_uccl_comm
 from xfuser.envs import (
     get_device,
     get_device_name,
@@ -118,12 +119,13 @@ class xFuserVAEWrapper:
                 # Get the rank of the DiT worker that will send the data
                 dit_rank = dit_parallel_size - 1  # Last DiT rank
                 # Receive data from DiT
+                uccl_comm = get_uccl_comm()
                 shape_len = torch.zeros(1, dtype=torch.int, device=device)
-                torch.distributed.recv(shape_len, src=dit_rank)
+                uccl_comm.recv(shape_len, src=dit_rank)
                 shape_tensor = torch.zeros(shape_len[0], dtype=torch.int, device=device)
-                torch.distributed.recv(shape_tensor, src=dit_rank)
+                uccl_comm.recv(shape_tensor, src=dit_rank)
                 latents = torch.zeros(torch.Size(shape_tensor), dtype=dtype, device=device)
-                torch.distributed.recv(latents, src=dit_rank)
+                uccl_comm.recv(latents, src=dit_rank)
                 # Broadcast data to VAE group
                 torch.distributed.broadcast(shape_len, src=rank, group=get_vae_parallel_group())
                 torch.distributed.broadcast(shape_tensor, src=rank, group=get_vae_parallel_group())
@@ -671,9 +673,10 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
                 # Get first VAE rank
                 vae_first_rank = get_dit_world_size()  # VAE ranks start after DiT ranks
                 # Send shape info and latents to first VAE rank
+                uccl_comm = get_uccl_comm()
                 shape_len = torch.tensor([len(latents.shape)], dtype=torch.int, device=device)
-                torch.distributed.send(shape_len, dst=vae_first_rank)
+                uccl_comm.send(shape_len, dst=vae_first_rank)
                 shape_tensor = torch.tensor(latents.shape, dtype=torch.int, device=device)
-                torch.distributed.send(shape_tensor, dst=vae_first_rank)
-                torch.distributed.send(latents, dst=vae_first_rank)
+                uccl_comm.send(shape_tensor, dst=vae_first_rank)
+                uccl_comm.send(latents, dst=vae_first_rank)
         return None

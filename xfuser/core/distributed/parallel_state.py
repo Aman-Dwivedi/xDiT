@@ -28,6 +28,7 @@ except ModuleNotFoundError:
     pass
 
 from .utils import RankGenerator
+from .uccl_comm import init_uccl_comm, finalize_uccl_comm, is_uccl_enabled
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
 HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
@@ -254,6 +255,14 @@ def init_distributed_environment(
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
         _WORLD = init_world_group(ranks, local_rank, backend)
+        
+        # Initialize UCCL P2P communication if enabled
+        try:
+            init_uccl_comm(local_gpu_idx=local_rank)
+            if is_uccl_enabled():
+                logger.info(f"[Rank {torch.distributed.get_rank()}] UCCL P2P communication enabled")
+        except Exception as e:
+            logger.warning(f"Failed to initialize UCCL P2P: {e}")
     else:
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
@@ -539,6 +548,13 @@ def destroy_model_parallel():
 
 def destroy_distributed_environment():
     global _WORLD
+    
+    # Finalize UCCL P2P communication first
+    try:
+        finalize_uccl_comm()
+    except Exception as e:
+        logger.warning(f"Failed to finalize UCCL P2P: {e}")
+    
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
