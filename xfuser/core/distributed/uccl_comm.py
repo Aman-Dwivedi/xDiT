@@ -3,8 +3,8 @@
 UCCL P2P Communication Wrapper for xDiT
 
 This module provides a drop-in replacement for torch.distributed send/recv operations
-using UCCL P2P's low-level API (from uccl import p2p). It automatically handles:
-- Connection management between ranks
+using UCCL Collective API (from uccl import collective). It automatically handles:
+- Connection management between ranks (local IPC and remote RDMA)
 - Memory registration for RDMA operations  
 - Metadata exchange via torch.distributed
 - Synchronous and asynchronous transfers
@@ -18,13 +18,13 @@ Environment Variables:
 from __future__ import annotations
 import os
 import warnings
-from typing import Optional, Dict, Any
+from typing import Optional, Any
 import torch
 import torch.distributed as dist
 
-# Try to import UCCL P2P API
+# Try to import UCCL Collective API
 try:
-    from uccl import p2p
+    from uccl import collective
     UCCL_AVAILABLE = True
 except ImportError as e:
     UCCL_AVAILABLE = False
@@ -33,19 +33,18 @@ except ImportError as e:
 
 class UCCLCommWrapper:
     """
-    Wrapper class for UCCL P2P communication using low-level p2p.Endpoint API.
+    Wrapper class for UCCL P2P communication using the collective API.
     
-    This class manages UCCL p2p endpoints and connections, providing methods compatible with
-    torch.distributed's send/recv API. It automatically handles memory registration
-    and connection establishment between all ranks.
+    This class wraps the UCCL collective API, providing methods compatible with
+    torch.distributed's send/recv API. The collective API automatically handles:
+    - Local IPC connections for same-node transfers
+    - Remote RDMA connections for cross-node transfers
+    - Memory registration only when needed (for remote connections)
     """
     
     def __init__(self):
         self._enabled = False
         self._initialized = False
-        self._endpoint: Optional[Any] = None  # p2p.Endpoint
-        self._connections: Dict[int, int] = {}  # rank -> conn_id
-        self._memory_regions: Dict[int, int] = {}  # tensor ptr -> mr_id
         self._use_uccl = os.environ.get("USE_UCCL_P2P", "0") == "1"
         self._num_cpus = int(os.environ.get("UCCL_NUM_CPUS", "4"))
         self._local_gpu_idx: Optional[int] = None
@@ -66,7 +65,7 @@ class UCCLCommWrapper:
     
     def initialize(self, local_gpu_idx: Optional[int] = None):
         """
-        Initialize UCCL p2p endpoint and establish connections with all ranks.
+        Initialize UCCL collective context and establish connections with all ranks.
         
         Args:
             local_gpu_idx: Optional GPU index. If None, derived from torch.distributed.
@@ -83,9 +82,6 @@ class UCCLCommWrapper:
                 "torch.distributed must be initialized before UCCL communication"
             )
         
-        # UCCL can work with any backend, but we need gloo for CPU group operations
-        # We'll create a separate gloo group for metadata exchange if needed
-        
         try:
             self._rank = dist.get_rank()
             self._world_size = dist.get_world_size()
@@ -97,121 +93,17 @@ class UCCLCommWrapper:
                 # Try to get from environment
                 self._local_gpu_idx = int(os.environ.get("LOCAL_RANK", self._rank))
             
-            # Create UCCL endpoint
-            self._endpoint = p2p.Endpoint(self._local_gpu_idx, self._num_cpus)
-            local_metadata = self._endpoint.get_metadata()
-            
-            # Exchange metadata with all ranks via torch.distributed
-            # If using NCCL backend, we need to move tensors to GPU for collective ops
-            backend = dist.get_backend()
-            all_metadata = [None] * self._world_size
-            
-            if backend == "nccl":
-                # NCCL requires GPU tensors
-                metadata_tensor = torch.ByteTensor(list(local_metadata)).cuda()
-                gathered_tensors = [
-                    torch.zeros_like(metadata_tensor) for _ in range(self._world_size)
-                ]
-                dist.all_gather(gathered_tensors, metadata_tensor)
-                # Move back to CPU and convert
-                for i, tensor in enumerate(gathered_tensors):
-                    all_metadata[i] = bytes(tensor.cpu().tolist())
-            else:
-                # Gloo and other backends work with CPU tensors
-                metadata_tensor = torch.ByteTensor(list(local_metadata))
-                gathered_tensors = [
-                    torch.zeros_like(metadata_tensor) for _ in range(self._world_size)
-                ]
-                dist.all_gather(gathered_tensors, metadata_tensor)
-                for i, tensor in enumerate(gathered_tensors):
-                    all_metadata[i] = bytes(tensor.tolist())
-            
-            # Establish connections with other ranks
-            # Strategy: Build full mesh by having each rank connect to higher ranks
-            # and accept from lower ranks. This ensures no deadlocks.
-            # For world_size=2: rank 0 connects to rank 1, rank 1 accepts from rank 0
-            
-            # First, count how many connections we need
-            num_connects = self._world_size - self._rank - 1  # connect to higher ranks
-            num_accepts = self._rank  # accept from lower ranks
-            
-            print(f"[Rank {self._rank}] Establishing connections: will connect to {num_connects} higher ranks, accept from {num_accepts} lower ranks")
-            
-            # Phase 1: Connect to all higher-ranked peers (non-blocking initiates)
-            pending_connects = []
-            for peer_rank in range(self._rank + 1, self._world_size):
-                ip, port, gpu_idx = p2p.Endpoint.parse_metadata(all_metadata[peer_rank])
-                ok, conn_id = self._endpoint.connect(ip, gpu_idx, remote_port=port)
-                if not ok:
-                    raise RuntimeError(f"[Rank {self._rank}] Failed to connect to rank {peer_rank}")
-                self._connections[peer_rank] = conn_id
-                pending_connects.append(peer_rank)
-                print(f"[Rank {self._rank}] Connected to rank {peer_rank} at {ip}:{port} (conn_id={conn_id})")
-            
-            # Phase 2: Accept connections from all lower-ranked peers
-            for _ in range(num_accepts):
-                ok, r_ip, r_gpu, conn_id = self._endpoint.accept()
-                if not ok:
-                    raise RuntimeError(f"[Rank {self._rank}] Failed to accept connection")
-                
-                # Find which rank this connection is from by matching IP/GPU
-                peer_rank = None
-                for candidate_rank in range(self._rank):
-                    candidate_ip, _, candidate_gpu = p2p.Endpoint.parse_metadata(all_metadata[candidate_rank])
-                    if candidate_ip == r_ip and candidate_gpu == r_gpu:
-                        peer_rank = candidate_rank
-                        break
-                
-                if peer_rank is None:
-                    raise RuntimeError(f"[Rank {self._rank}] Accepted connection from unknown peer {r_ip}:{r_gpu}")
-                
-                self._connections[peer_rank] = conn_id
-                print(f"[Rank {self._rank}] Accepted connection from rank {peer_rank} (conn_id={conn_id})")
-            
-            # Verify we have the right number of connections
-            expected_connections = self._world_size - 1
-            if len(self._connections) != expected_connections:
-                raise RuntimeError(
-                    f"[Rank {self._rank}] Expected {expected_connections} connections but got {len(self._connections)}"
-                )
+            # Initialize UCCL collective context
+            collective.init_collective(num_cpus=self._num_cpus, local_gpu_idx=self._local_gpu_idx)
             
             self._initialized = True
             self._enabled = True
-            print(f"[Rank {self._rank}] UCCL P2P communication initialized with {len(self._connections)} connections")
+            print(f"[Rank {self._rank}] UCCL collective communication initialized")
             
         except Exception as e:
-            warnings.warn(f"Failed to initialize UCCL P2P: {e}. Falling back to torch.distributed.")
+            warnings.warn(f"Failed to initialize UCCL collective: {e}. Falling back to torch.distributed.")
             self._use_uccl = False
             self._enabled = False
-    
-    def _register_tensor(self, tensor: torch.Tensor) -> int:
-        """
-        Register a tensor for UCCL communication and return memory region ID.
-        
-        Args:
-            tensor: Tensor to register
-            
-        Returns:
-            Memory region ID
-        """
-        ptr = tensor.data_ptr()
-        if ptr in self._memory_regions:
-            return self._memory_regions[ptr]
-        
-        size = tensor.numel() * tensor.element_size()
-        ok, mr_id = self._endpoint.reg(ptr, size)
-        if not ok:
-            raise RuntimeError(f"Failed to register memory at {ptr} with size {size}")
-        
-        self._memory_regions[ptr] = mr_id
-        return mr_id
-    
-    def _get_or_register_tensor(self, tensor: torch.Tensor) -> int:
-        """Get memory region ID for tensor, registering if necessary."""
-        ptr = tensor.data_ptr()
-        if ptr in self._memory_regions:
-            return self._memory_regions[ptr]
-        return self._register_tensor(tensor)
     
     def send(self, tensor: torch.Tensor, dst: int, group=None):
         """
@@ -225,17 +117,7 @@ class UCCLCommWrapper:
         if not self._enabled:
             return dist.send(tensor, dst=dst, group=group)
         
-        if dst not in self._connections:
-            raise RuntimeError(f"No connection to rank {dst}")
-        
-        conn_id = self._connections[dst]
-        mr_id = self._get_or_register_tensor(tensor)
-        ptr = tensor.data_ptr()
-        size = tensor.numel() * tensor.element_size()
-        
-        ok = self._endpoint.send(conn_id, mr_id, ptr, size)
-        if not ok:
-            raise RuntimeError(f"Failed to send tensor to rank {dst}")
+        collective.send(tensor, dst)
     
     def recv(self, tensor: torch.Tensor, src: int, group=None):
         """
@@ -249,17 +131,7 @@ class UCCLCommWrapper:
         if not self._enabled:
             return dist.recv(tensor, src=src, group=group)
         
-        if src not in self._connections:
-            raise RuntimeError(f"No connection from rank {src}")
-        
-        conn_id = self._connections[src]
-        mr_id = self._get_or_register_tensor(tensor)
-        ptr = tensor.data_ptr()
-        size = tensor.numel() * tensor.element_size()
-        
-        ok = self._endpoint.recv(conn_id, mr_id, ptr, size)
-        if not ok:
-            raise RuntimeError(f"Failed to receive tensor from rank {src}")
+        collective.recv(tensor, src)
     
     def isend(self, tensor: torch.Tensor, dst: int, group=None) -> Any:
         """
@@ -276,19 +148,10 @@ class UCCLCommWrapper:
         if not self._enabled:
             return dist.isend(tensor, dst=dst, group=group)
         
-        if dst not in self._connections:
-            raise RuntimeError(f"No connection to rank {dst}")
-        
-        conn_id = self._connections[dst]
-        mr_id = self._get_or_register_tensor(tensor)
-        ptr = tensor.data_ptr()
-        size = tensor.numel() * tensor.element_size()
-        
-        ok, transfer_id = self._endpoint.send_async(conn_id, mr_id, ptr, size)
-        if not ok:
-            raise RuntimeError(f"Failed to initiate async send to rank {dst}")
-        
-        return UCCLTransferHandle(transfer_id, self)
+        # Register tensor for RDMA if needed (collective API handles this intelligently)
+        collective.register_tensor(tensor)
+        transfer_id = collective.isend(tensor, dst)
+        return UCCLTransferHandle(transfer_id)
     
     def irecv(self, tensor: torch.Tensor, src: int, group=None) -> Any:
         """
@@ -305,70 +168,33 @@ class UCCLCommWrapper:
         if not self._enabled:
             return dist.irecv(tensor, src=src, group=group)
         
-        if src not in self._connections:
-            raise RuntimeError(f"No connection from rank {src}")
-        
-        conn_id = self._connections[src]
-        mr_id = self._get_or_register_tensor(tensor)
-        ptr = tensor.data_ptr()
-        size = tensor.numel() * tensor.element_size()
-        
-        ok, transfer_id = self._endpoint.recv_async(conn_id, mr_id, ptr, size)
-        if not ok:
-            raise RuntimeError(f"Failed to initiate async recv from rank {src}")
-        
-        return UCCLTransferHandle(transfer_id, self)
-    
-    def wait(self, transfer_id: int):
-        """
-        Wait for asynchronous operation to complete.
-        
-        Args:
-            transfer_id: Transfer ID returned by isend/irecv
-        """
-        if not self._enabled:
-            return
-        
-        while True:
-            ok, is_done = self._endpoint.poll_async(transfer_id)
-            if not ok:
-                raise RuntimeError(f"Error polling transfer {transfer_id}")
-            if is_done:
-                break
+        # Register tensor for RDMA if needed (collective API handles this intelligently)
+        collective.register_tensor(tensor)
+        transfer_id = collective.irecv(tensor, src)
+        return UCCLTransferHandle(transfer_id)
     
     def finalize(self):
         """Clean up UCCL resources."""
         if self._enabled and self._initialized:
-            # Deregister all memory regions
-            for mr_id in self._memory_regions.values():
-                self._endpoint.dereg(mr_id)
-            self._memory_regions.clear()
-            
-            # Clear connections
-            self._connections.clear()
-            
-            # Endpoint will be cleaned up automatically
-            self._endpoint = None
+            collective.finalize_collective()
             self._initialized = False
             self._enabled = False
-            print(f"[Rank {self._rank}] UCCL P2P communication finalized")
+            print(f"[Rank {self._rank}] UCCL collective communication finalized")
 
 
 class UCCLTransferHandle:
     """Handle for UCCL asynchronous transfers, compatible with torch.distributed.Work API."""
     
-    def __init__(self, transfer_id: int, comm_wrapper: UCCLCommWrapper):
+    def __init__(self, transfer_id: int):
         self._transfer_id = transfer_id
-        self._comm_wrapper = comm_wrapper
     
     def wait(self):
         """Wait for the transfer to complete."""
-        self._comm_wrapper.wait(self._transfer_id)
+        collective.wait(self._transfer_id)
     
     def is_completed(self) -> bool:
         """Check if the transfer is completed."""
-        # UCCL doesn't provide a non-blocking check, so we return False
-        return False
+        return collective.test(self._transfer_id)
 
 
 # Global UCCL communication wrapper instance
