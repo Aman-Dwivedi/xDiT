@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test output
+test_profiling_output/
+test_integration_output/
