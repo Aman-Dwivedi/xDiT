@@ -10,7 +10,9 @@ profile/
 xfuser.egg-info/
 dist/*
 *.mp4
+aiter/
 
 # P2P Profiling results
 profiling_results/
 past_profiling_results/
+
