@@ -12,7 +12,15 @@ from xfuser.core.distributed import (
     get_runtime_state,
     get_data_parallel_rank,
 )
+import sys
+_xdit_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+_profiling_lib_path = os.path.join(_xdit_root, 'p2p_profiling_lib')
 
+# Add to path if not already there
+if _profiling_lib_path not in sys.path:
+    sys.path.insert(0, _xdit_root)
+
+from p2p_profiling_lib import get_profiler, enable_profiling
 
 def main():
     parser = FlexibleArgumentParser(description="xFuser Arguments")
@@ -71,7 +79,9 @@ def main():
                 )
                 image.save(img_file)
                 print(img_file)
-
+    profiler = get_profiler()
+    profiler.finalize()
+    print("[P2P Profiling] Finalized and statistics saved")
     if get_world_group().rank == get_world_group().world_size - 1:
         print(
             f"epoch time: {elapsed_time:.2f} sec, model memory: {model_memory/1e9:.2f} GB, overall memory: {peak_memory/1e9:.2f} GB"

@@ -54,37 +54,40 @@ def compile_stats(raw_csv_path: str, summary_csv_path: str):
         'avg_duration_ms': 0,
         'avg_size_mb': 0
     })
-
+    missed = 0
     for record in records:
-        operation = record['operation']
-        comm_type = record['comm_type']
-        sync_mode = record['sync_mode']
-        data_size = int(record['data_size_bytes'])
-        duration = float(record['duration_ms'])
-        success = record['success'].lower() == 'true'
+        try:
+            operation = record['operation']
+            comm_type = record['comm_type']
+            sync_mode = record['sync_mode']
+            data_size = int(record['data_size_bytes'])
+            duration = float(record['duration_ms'])
+            success = record['success'].lower() == 'true'
 
-        # Update totals
-        stats['total_data_bytes'] += data_size
-        stats['total_duration_ms'] += duration
+            # Update totals
+            stats['total_data_bytes'] += data_size
+            stats['total_duration_ms'] += duration
 
-        if operation == 'send':
-            stats['total_send'] += 1
-        else:
-            stats['total_recv'] += 1
+            if operation == 'send':
+                stats['total_send'] += 1
+            else:
+                stats['total_recv'] += 1
 
-        if not success:
-            stats['failed_operations'] += 1
+            if not success:
+                stats['failed_operations'] += 1
 
-        # Update specific category
-        key = f"{comm_type}_{operation}_{sync_mode}"
-        stats[key] = stats.get(key, 0) + 1
+            # Update specific category
+            key = f"{comm_type}_{operation}_{sync_mode}"
+            stats[key] = stats.get(key, 0) + 1
 
-        # Update category stats
-        category = f"{comm_type.upper()}_{operation.upper()}_{sync_mode.upper()}"
-        category_stats[category]['count'] += 1
-        category_stats[category]['total_bytes'] += data_size
-        category_stats[category]['total_duration_ms'] += duration
-
+            # Update category stats
+            category = f"{comm_type.upper()}_{operation.upper()}_{sync_mode.upper()}"
+            category_stats[category]['count'] += 1
+            category_stats[category]['total_bytes'] += data_size
+            category_stats[category]['total_duration_ms'] += duration
+        except:
+            missed += 1
+    print("Errors in", missed)
     # Compute averages
     if stats['total_operations'] > 0:
         stats['avg_duration_ms'] = stats['total_duration_ms'] / stats['total_operations']

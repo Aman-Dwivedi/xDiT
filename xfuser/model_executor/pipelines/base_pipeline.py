@@ -64,6 +64,16 @@ try:
 except:
     HAS_OF = False
 
+import sys, os
+_xdit_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+_profiling_lib_path = os.path.join(_xdit_root, 'p2p_profiling_lib')
+
+# Add to path if not already there
+if _profiling_lib_path not in sys.path:
+    sys.path.insert(0, _xdit_root)
+
+from p2p_profiling_lib import get_profiler, enable_profiling
+
 logger = init_logger(__name__)
 
 class xFuserVAEWrapper:
@@ -85,6 +95,10 @@ class xFuserVAEWrapper:
                               dit_parallel_config.cfg_degree * 
                               dit_parallel_config.dp_degree * 
                               dit_parallel_config.tp_degree)
+        node_rank = int(os.environ.get("NODE_RANK", "0"))
+        profiler = enable_profiling(node_rank=node_rank)
+        profiler.set_rank(torch.distributed.get_rank() if torch.distributed.is_initialized() else 0)
+        print("Profiler setup in XFuserVAEWrapper.")
         # Calculate DiT model's dp_last_group rank
         if use_parallel:
             # Calculate rank in dp_last_group
@@ -119,11 +133,15 @@ class xFuserVAEWrapper:
                 dit_rank = dit_parallel_size - 1  # Last DiT rank
                 # Receive data from DiT
                 shape_len = torch.zeros(1, dtype=torch.int, device=device)
-                torch.distributed.recv(shape_len, src=dit_rank)
+                profiler = get_profiler()
+                with profiler.profile_recv(shape_len, dit_rank, comm_type='nccl', sync_mode='sync', call_site="xFuser VAE shape_len"):
+                    torch.distributed.recv(shape_len, src=dit_rank)
                 shape_tensor = torch.zeros(shape_len[0], dtype=torch.int, device=device)
-                torch.distributed.recv(shape_tensor, src=dit_rank)
+                with profiler.profile_recv(shape_tensor, dit_rank, comm_type='nccl', sync_mode='sync', call_site="xFuser VAE shape_tensor"):
+                    torch.distributed.recv(shape_tensor, src=dit_rank)
                 latents = torch.zeros(torch.Size(shape_tensor), dtype=dtype, device=device)
-                torch.distributed.recv(latents, src=dit_rank)
+                with profiler.profile_recv(latents, dit_rank, comm_type='nccl', sync_mode='sync', call_site="xFuser VAE latents"):
+                    torch.distributed.recv(latents, src=dit_rank)
                 # Broadcast data to VAE group
                 torch.distributed.broadcast(shape_len, src=rank, group=get_vae_parallel_group())
                 torch.distributed.broadcast(shape_tensor, src=rank, group=get_vae_parallel_group())
@@ -180,7 +198,11 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
                 pipeline.vae.to("cpu")  # VAE is not executed in the current worker
             elif not self.use_naive_forward():
                 pipeline.vae = self._convert_vae(vae)
-
+        
+        node_rank = int(os.environ.get("NODE_RANK", "0"))
+        profiler = enable_profiling(node_rank=node_rank)
+        profiler.set_rank(torch.distributed.get_rank() if torch.distributed.is_initialized() else 0)
+        print("Profiler setup in XFuserPipeline.")
         super().__init__(module=pipeline)
 
     def reset_activation_cache(self):
@@ -590,6 +612,7 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
 
         # All processes participate in all_gather
         gathered_ranks = [torch.zeros(1, dtype=torch.int64, device=device) for _ in range(dit_parallel_size)]
+        print("AllGather being used Line 615 XFuser")
         torch.distributed.all_gather(gathered_ranks, rank_tensor,group=get_dit_group())
         # Filter out valid ranks (non -1)
         dp_rank_list = [int(r.item()) for r in gathered_ranks if r.item() != -1]
@@ -621,6 +644,7 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
             gather_rank = int(rank)
         else:
             gather_rank = -1
+        print("AllGather being used Line 648 XFuser")
         torch.distributed.all_gather(dp_rank_list, torch.tensor([gather_rank],dtype=int,device=device))
         
         dp_rank_list = [int(dp_rank[0]) for dp_rank in dp_rank_list if int(dp_rank[0])!=-1]
@@ -672,8 +696,12 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
                 vae_first_rank = get_dit_world_size()  # VAE ranks start after DiT ranks
                 # Send shape info and latents to first VAE rank
                 shape_len = torch.tensor([len(latents.shape)], dtype=torch.int, device=device)
-                torch.distributed.send(shape_len, dst=vae_first_rank)
+                profiler = get_profiler()
+                with profiler.profile_send(shape_len, vae_first_rank, comm_type='nccl', sync_mode='sync', call_site="xFuser Pipeline send_to_vae_decode shape_len"):
+                    torch.distributed.send(shape_len, dst=vae_first_rank)
                 shape_tensor = torch.tensor(latents.shape, dtype=torch.int, device=device)
-                torch.distributed.send(shape_tensor, dst=vae_first_rank)
-                torch.distributed.send(latents, dst=vae_first_rank)
+                with profiler.profile_send(shape_tensor, vae_first_rank, comm_type='nccl', sync_mode='sync', call_site="xFuser Pipeline send_to_vae_decode shape_tensor"):
+                    torch.distributed.send(shape_tensor, dst=vae_first_rank)
+                with profiler.profile_send(latents, vae_first_rank, comm_type='nccl', sync_mode='sync', call_site="xFuser Pipeline send_to_vae_decode latents"):
+                    torch.distributed.send(latents, dst=vae_first_rank)
         return None

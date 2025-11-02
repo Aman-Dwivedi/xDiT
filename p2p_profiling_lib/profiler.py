@@ -28,6 +28,7 @@ class TransferRecord:
     dtype: str
     success: bool
     error_msg: str = ""
+    call_site: str = ""
 
 class P2PProfiler:
     """
@@ -107,7 +108,7 @@ class P2PProfiler:
             writer = csv.DictWriter(f, fieldnames=[
                 'timestamp', 'operation', 'comm_type', 'sync_mode',
                 'data_size_bytes', 'duration_ms', 'src_rank', 'dst_rank',
-                'tensor_shape', 'dtype', 'success', 'error_msg'
+                'tensor_shape', 'dtype', 'success', 'error_msg', 'call_site'
             ])
             writer.writeheader()
 
@@ -119,7 +120,7 @@ class P2PProfiler:
         """Context manager for profiling a single operation."""
 
         def __init__(self, profiler: 'P2PProfiler', operation: str, comm_type: str,
-                     sync_mode: str, tensor: Optional[torch.Tensor], src_rank: int, dst_rank: int):
+                     sync_mode: str, tensor: Optional[torch.Tensor], src_rank: int, dst_rank: int, call_site: str = ""):
             self.profiler = profiler
             self.operation = operation
             self.comm_type = comm_type
@@ -127,6 +128,7 @@ class P2PProfiler:
             self.tensor = tensor
             self.src_rank = src_rank
             self.dst_rank = dst_rank
+            self.call_site = call_site
             self.start_time = None
             self.record = None
 
@@ -162,7 +164,8 @@ class P2PProfiler:
                     tensor_shape=tensor_shape,
                     dtype=dtype,
                     success=(exc_type is None),
-                    error_msg=str(exc_val) if exc_val else ""
+                    error_msg=str(exc_val) if exc_val else "",
+                    call_site=self.call_site
                 )
 
                 self.profiler._record_transfer(record)
@@ -170,7 +173,7 @@ class P2PProfiler:
             return False  # Don't suppress exceptions
 
     def profile_send(self, tensor: torch.Tensor, dst_rank: int, 
-                     comm_type: str, sync_mode: str) -> ProfileContext:
+                     comm_type: str, sync_mode: str, call_site: str = "") -> ProfileContext:
         """
         Profile a send operation.
         
@@ -181,10 +184,10 @@ class P2PProfiler:
             sync_mode: 'sync' or 'async'
         """
         src_rank = self.current_rank if self.current_rank is not None else -1
-        return self.ProfileContext(self, 'send', comm_type, sync_mode, tensor, src_rank, dst_rank)
+        return self.ProfileContext(self, 'send', comm_type, sync_mode, tensor, src_rank, dst_rank, call_site)
 
     def profile_recv(self, tensor: Optional[torch.Tensor], src_rank: int,
-                     comm_type: str, sync_mode: str) -> ProfileContext:
+                     comm_type: str, sync_mode: str, call_site: str = "") -> ProfileContext:
         """
         Profile a recv operation.
         
@@ -195,7 +198,7 @@ class P2PProfiler:
             sync_mode: 'sync' or 'async'
         """
         dst_rank = self.current_rank if self.current_rank is not None else -1
-        return self.ProfileContext(self, 'recv', comm_type, sync_mode, tensor, src_rank, dst_rank)
+        return self.ProfileContext(self, 'recv', comm_type, sync_mode, tensor, src_rank, dst_rank, call_site)
 
     def _record_transfer(self, record: TransferRecord):
         """Record a transfer (thread-safe)."""
@@ -209,7 +212,7 @@ class P2PProfiler:
             writer = csv.DictWriter(f, fieldnames=[
                 'timestamp', 'operation', 'comm_type', 'sync_mode',
                 'data_size_bytes', 'duration_ms', 'src_rank', 'dst_rank',
-                'tensor_shape', 'dtype', 'success', 'error_msg'
+                'tensor_shape', 'dtype', 'success', 'error_msg', 'call_site'
             ])
             writer.writerow(asdict(record))
 

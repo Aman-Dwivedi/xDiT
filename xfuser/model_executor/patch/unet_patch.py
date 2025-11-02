@@ -52,7 +52,7 @@ def unet_cfg_parallel_monkey_patch_forward(
         self.output_buffer = torch.empty((b, c, h, w), device=output.device, dtype=output.dtype)
     if self.buffer_list is None:
         self.buffer_list = [torch.empty_like(output) for _ in range(world_size)]
-
+    print("AllGather being used Line 55 unet_patch")
     dist.all_gather(self.buffer_list, output.contiguous(), async_op=False)
     torch.cat(self.buffer_list[: 1], dim=2, out=self.output_buffer[0:1])
     torch.cat(self.buffer_list[1 :], dim=2, out=self.output_buffer[1:2])
