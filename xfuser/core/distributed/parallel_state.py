@@ -397,6 +397,7 @@ def initialize_model_parallel(
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
+    rank: int = torch.distributed.get_rank()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
     if sequence_parallel_degree is None:
@@ -423,90 +424,100 @@ def initialize_model_parallel(
         * tensor_parallel_degree
     )
 
-    if world_size < dit_parallel_size:
-        raise RuntimeError(
-            f"world_size ({world_size}) is less than "
-            f"tensor_parallel_degree ({tensor_parallel_degree}) x "
-            f"pipeline_parallel_degree ({pipeline_parallel_degree}) x"
-            f"sequence_parallel_degree ({sequence_parallel_degree}) x"
-            f"classifier_free_guidance_degree "
-            f"({classifier_free_guidance_degree}) x"
-            f"data_parallel_degree ({data_parallel_degree})"
-        )
-
-    rank_generator: RankGenerator = RankGenerator(
-        tensor_parallel_degree,
-        sequence_parallel_degree,
-        pipeline_parallel_degree,
-        classifier_free_guidance_degree,
-        data_parallel_degree,
-        "tp-sp-pp-cfg-dp",
-    )
-    global _DP
-    assert _DP is None, "data parallel group is already initialized"
-    _DP = init_model_parallel_group(
-        group_ranks=rank_generator.get_ranks("dp"),
-        local_rank=get_world_group().local_rank,
-        backend=backend,
-        parallel_mode="data",
-    )
-
-    global _CFG
-    assert _CFG is None, "classifier_free_guidance group is already initialized"
-    _CFG = init_model_parallel_group(
-        group_ranks=rank_generator.get_ranks("cfg"),
-        local_rank=get_world_group().local_rank,
-        backend=backend,
-        parallel_mode="classifier_free_guidance",
-    )
-    global _PP
-    assert _PP is None, "pipeline model parallel group is already initialized"
-    _PP = init_model_parallel_group(
-        group_ranks=rank_generator.get_ranks("pp"),
-        local_rank=get_world_group().local_rank,
-        backend=backend,
-        parallel_mode="pipeline",
-    )
-
-    global _SP
-    assert _SP is None, "sequence parallel group is already initialized"
-
-    # if HAS_LONG_CTX_ATTN and sequence_parallel_degree > 1:
-    if HAS_LONG_CTX_ATTN:
-        from yunchang import set_seq_parallel_pg
-        from yunchang.globals import PROCESS_GROUP
-
-        set_seq_parallel_pg(
-            sp_ulysses_degree=ulysses_degree,
-            sp_ring_degree=ring_degree,
-            rank=get_world_group().rank_in_group,
-            world_size=dit_parallel_size,
-        )
-
-        _SP = init_model_parallel_group(
-            group_ranks=rank_generator.get_ranks("sp"),
-            local_rank=get_world_group().local_rank,
-            backend=backend,
-            parallel_mode="sequence",
-            ulysses_group=PROCESS_GROUP.ULYSSES_PG,
-            ring_group=PROCESS_GROUP.RING_PG,
-        )
+    # If this rank is a VAE rank, skip model parallel group initialization
+    # VAE ranks will have their own group initialized separately via init_vae_group
+    is_vae_rank = rank >= dit_parallel_size
+    if is_vae_rank:
+        logger.info(f"Rank {rank} is a VAE rank (dit_parallel_size={dit_parallel_size}), skipping model parallel group initialization")
+        # VAE ranks don't participate in model parallel group creation
+        # We'll initialize the VAE group at the end (along with DIT ranks) since
+        # torch.distributed.new_group requires all ranks to participate
     else:
-        _SP = init_model_parallel_group(
-            group_ranks=rank_generator.get_ranks("sp"),
+        # DIT ranks initialize model parallel groups
+        if world_size < dit_parallel_size:
+            raise RuntimeError(
+                f"world_size ({world_size}) is less than "
+                f"tensor_parallel_degree ({tensor_parallel_degree}) x "
+                f"pipeline_parallel_degree ({pipeline_parallel_degree}) x"
+                f"sequence_parallel_degree ({sequence_parallel_degree}) x"
+                f"classifier_free_guidance_degree "
+                f"({classifier_free_guidance_degree}) x"
+                f"data_parallel_degree ({data_parallel_degree})"
+            )
+
+        rank_generator: RankGenerator = RankGenerator(
+            tensor_parallel_degree,
+            sequence_parallel_degree,
+            pipeline_parallel_degree,
+            classifier_free_guidance_degree,
+            data_parallel_degree,
+            "tp-sp-pp-cfg-dp",
+        )
+        global _DP
+        assert _DP is None, "data parallel group is already initialized"
+        _DP = init_model_parallel_group(
+            group_ranks=rank_generator.get_ranks("dp"),
             local_rank=get_world_group().local_rank,
             backend=backend,
-            parallel_mode="sequence",
+            parallel_mode="data",
         )
 
-    global _TP
-    assert _TP is None, "Tensor parallel group is already initialized"
-    _TP = init_model_parallel_group(
-        group_ranks=rank_generator.get_ranks("tp"),
-        local_rank=get_world_group().local_rank,
-        backend=backend,
-        parallel_mode="tensor",
-    )
+        global _CFG
+        assert _CFG is None, "classifier_free_guidance group is already initialized"
+        _CFG = init_model_parallel_group(
+            group_ranks=rank_generator.get_ranks("cfg"),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="classifier_free_guidance",
+        )
+        global _PP
+        assert _PP is None, "pipeline model parallel group is already initialized"
+        _PP = init_model_parallel_group(
+            group_ranks=rank_generator.get_ranks("pp"),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="pipeline",
+        )
+
+        global _SP
+        assert _SP is None, "sequence parallel group is already initialized"
+
+        # if HAS_LONG_CTX_ATTN and sequence_parallel_degree > 1:
+        if HAS_LONG_CTX_ATTN:
+            from yunchang import set_seq_parallel_pg
+            from yunchang.globals import PROCESS_GROUP
+
+            set_seq_parallel_pg(
+                sp_ulysses_degree=ulysses_degree,
+                sp_ring_degree=ring_degree,
+                rank=get_world_group().rank_in_group,
+                world_size=dit_parallel_size,
+            )
+
+            _SP = init_model_parallel_group(
+                group_ranks=rank_generator.get_ranks("sp"),
+                local_rank=get_world_group().local_rank,
+                backend=backend,
+                parallel_mode="sequence",
+                ulysses_group=PROCESS_GROUP.ULYSSES_PG,
+                ring_group=PROCESS_GROUP.RING_PG,
+            )
+        else:
+            _SP = init_model_parallel_group(
+                group_ranks=rank_generator.get_ranks("sp"),
+                local_rank=get_world_group().local_rank,
+                backend=backend,
+                parallel_mode="sequence",
+            )
+
+        global _TP
+        assert _TP is None, "Tensor parallel group is already initialized"
+        _TP = init_model_parallel_group(
+            group_ranks=rank_generator.get_ranks("tp"),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="tensor",
+        )
 
     if vae_parallel_size > 0:
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
@@ -541,8 +552,12 @@ def destroy_model_parallel():
     _PP = None
 
     global _VAE
-    if _VAE:
-        _VAE.destroy()
+    if _VAE is not None:
+        # _VAE might be a ProcessGroup (from torch.distributed.new_group) or a GroupCoordinator
+        # ProcessGroups don't have a destroy() method - they're managed by torch.distributed
+        if hasattr(_VAE, 'destroy'):
+            _VAE.destroy()
+        # If it's a ProcessGroup, torch.distributed will clean it up automatically
     _VAE = None
 
 

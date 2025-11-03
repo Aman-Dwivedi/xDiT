@@ -13,6 +13,5 @@ dist/*
 aiter/
 
 # P2P Profiling results
-profiling_results/
 past_profiling_results/
 

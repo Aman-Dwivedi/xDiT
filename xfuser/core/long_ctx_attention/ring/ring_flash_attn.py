@@ -5,6 +5,8 @@ import torch.nn.functional as F
 
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
+from xfuser.envs import PACKAGES_CHECKER
+
 if torch.cuda.is_available():
     from yunchang.ring.utils import RingComm, update_out_and_lse
     from yunchang.ring.ring_flash_attn import RingFlashAttnFunc
@@ -21,6 +23,11 @@ try:
 except ImportError:
     flash_attn = None
     _flash_attn_forward = None
+
+# Check availability of attention backends
+env_info = PACKAGES_CHECKER.get_packages_info()
+HAS_AITER = env_info.get("has_aiter", False)
+HAS_FLASH_ATTN = env_info.get("has_flash_attn", False)
 
 def xdit_ring_flash_attn_forward(
     process_group,
@@ -63,6 +70,15 @@ def xdit_ring_flash_attn_forward(
 
     comm = RingComm(process_group)
 
+    # Safety check: if attn_type is AITER but AITER is not available, fall back
+    actual_attn_type = attn_type
+    if AttnType is not None and attn_type == AttnType.AITER and not HAS_AITER:
+        # Fall back to FA if available, otherwise TORCH
+        if HAS_FLASH_ATTN:
+            actual_attn_type = AttnType.FA
+        else:
+            actual_attn_type = AttnType.TORCH
+
     out = None
     lse = None
 
@@ -100,8 +116,38 @@ def xdit_ring_flash_attn_forward(
             key, value = k, v
 
         if not causal or step <= comm.rank:
-            fn = select_flash_attn_impl(attn_type, stage="fwd-only", attn_processor=attn_processor)
-            if attn_type == AttnType.FA3: 
+            # Double-check: ensure we never request AITER if it's not available
+            safe_attn_type = actual_attn_type
+            if AttnType is not None and actual_attn_type == AttnType.AITER and not HAS_AITER:
+                # Final safety check - should not happen but be defensive
+                safe_attn_type = AttnType.FA if HAS_FLASH_ATTN else AttnType.TORCH
+            
+            fn = select_flash_attn_impl(safe_attn_type, stage="fwd-only", attn_processor=attn_processor)
+            
+            # Wrap the function to catch any AITER calls that might slip through
+            # This is a safety net in case yunchang's select_flash_attn_impl returns AITER despite our check
+            original_fn = fn
+            fallback_type = safe_attn_type  # Capture for closure
+            
+            def safe_fn(*args, **kwargs):
+                # If yunchang somehow returns an AITER function, catch and fallback
+                try:
+                    return original_fn(*args, **kwargs)
+                except (AssertionError, RuntimeError) as e:
+                    error_str = str(e)
+                    if "Aiter is not available" in error_str or "AITER" in error_str.upper():
+                        # Fallback to FA if available, otherwise TORCH
+                        if HAS_FLASH_ATTN and fallback_type != AttnType.FA:
+                            fallback_fn = select_flash_attn_impl(AttnType.FA, stage="fwd-only", attn_processor=attn_processor)
+                            return fallback_fn(*args, **kwargs)
+                        elif fallback_type != AttnType.TORCH:
+                            fallback_fn = select_flash_attn_impl(AttnType.TORCH, stage="fwd-only", attn_processor=attn_processor)
+                            return fallback_fn(*args, **kwargs)
+                    raise
+            fn = safe_fn
+            
+            # Use actual_attn_type for FA3 check as well (but safe_attn_type for function call)
+            if actual_attn_type == AttnType.FA3 or safe_attn_type == AttnType.FA3: 
                 block_out, block_lse = fn(
                     q,
                     key,
@@ -130,7 +176,7 @@ def xdit_ring_flash_attn_forward(
                     alibi_slopes=alibi_slopes,
                     return_softmax=True and dropout_p > 0,
                 )
-            if attn_type == AttnType.SPARSE_SAGE:
+            if actual_attn_type == AttnType.SPARSE_SAGE:
                 out, lse = block_out, block_lse
             else:
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
@@ -141,7 +187,7 @@ def xdit_ring_flash_attn_forward(
             v = next_v
 
     out = out.to(q.dtype)
-    if attn_type != AttnType.SPARSE_SAGE:
+    if actual_attn_type != AttnType.SPARSE_SAGE:
         lse = lse.squeeze(dim=-1).transpose(1, 2)
     return out, lse
 

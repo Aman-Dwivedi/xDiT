@@ -112,6 +112,20 @@ class UCCLCommWrapper:
                 # Try to get from environment
                 self._local_gpu_idx = int(os.environ.get("LOCAL_RANK", self._rank))
             
+            # Clean up any stale UDS sockets before initialization
+            # This helps prevent connection issues from previous failed runs
+            import glob
+            import os as os_module
+            stale_sockets = glob.glob("/tmp/uccl_gpu_*.sock")
+            for sock_path in stale_sockets:
+                try:
+                    os_module.unlink(sock_path)
+                except OSError:
+                    pass  # Socket might not exist, ignore
+            
+            # Barrier to ensure all ranks clean up before starting
+            dist.barrier()
+            
             # Initialize UCCL collective context
             # Use disable_uccl_intra=True to use NCCL for intra-node, UCCL only for inter-node RDMA
             collective.init_collective(

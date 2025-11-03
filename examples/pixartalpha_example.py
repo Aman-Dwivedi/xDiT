@@ -20,7 +20,26 @@ def main():
     engine_args = xFuserArgs.from_cli_args(args)
     engine_config, input_config = engine_args.create_config()
     local_rank = get_world_group().local_rank
-    text_encoder = T5EncoderModel.from_pretrained(engine_config.model_config.model, subfolder="text_encoder", torch_dtype=torch.float16)
+
+    # Handle local model paths - construct full path to text_encoder subfolder
+    # When using local paths, we must avoid the 'subfolder' parameter to prevent
+    # HuggingFace Hub from trying to validate the path as a repo ID
+    model_path = engine_config.model_config.model
+    # Check if path looks like a local filesystem path (starts with /, ./, or ../)
+    is_local_path = (
+        model_path.startswith('/') or 
+        model_path.startswith('./') or 
+        model_path.startswith('../') or
+        (os.path.exists(model_path) and os.path.isdir(model_path))
+    )
+    
+    if is_local_path:
+        # Local path - construct full path to text_encoder
+        text_encoder_path = os.path.join(model_path, "text_encoder")
+        text_encoder = T5EncoderModel.from_pretrained(text_encoder_path, torch_dtype=torch.float16, local_files_only=True)
+    else:
+        # Hub repo ID - use subfolder parameter
+        text_encoder = T5EncoderModel.from_pretrained(model_path, subfolder="text_encoder", torch_dtype=torch.float16)
     if args.use_fp8_t5_encoder:
         from optimum.quanto import freeze, qfloat8, quantize
         print(f"rank {local_rank} quantizing text encoder")
