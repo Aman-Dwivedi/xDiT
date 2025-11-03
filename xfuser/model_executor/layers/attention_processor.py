@@ -76,17 +76,47 @@ def set_hybrid_seq_parallel_attn(self, use_long_ctx_attn_kvcache):
     Initialize hybrid sequence-parallel attention based on available backend.
     """
     if HAS_LONG_CTX_ATTN and get_sequence_parallel_world_size() > 1:
-        from xfuser.core.long_ctx_attention import (
-            xFuserLongContextAttention,
-        )
-        from yunchang.kernels import AttnType
+        try:
+            from xfuser.core.long_ctx_attention import (
+                xFuserLongContextAttention,
+            )
+            from yunchang.kernels import AttnType
+        except (ImportError, RuntimeError, ValueError) as e:
+            logger.warning(
+                f"Failed to import yunchang for hybrid sequence-parallel attention: {e}. "
+                "Falling back to standard attention."
+            )
+            self.hybrid_seq_parallel_attn = None
+            return
 
-        if HAS_AITER:
-            assert 'AITER' in AttnType.__members__, f"AttnType.AITER not implemented in yunchang version: {yunchang.__version__}. Upgrade to latest version from source."
+        if HAS_AITER and 'AITER' in AttnType.__members__:
             self.hybrid_seq_parallel_attn = xFuserLongContextAttention(
                     use_kv_cache=self.use_long_ctx_attn_kvcache,
                     attn_type=AttnType.AITER,
             )
+        elif HAS_AITER:
+            # AITER is installed but not supported in yunchang, fall back
+            try:
+                import yunchang
+                logger.warning(
+                    f"AttnType.AITER not implemented in yunchang version: {yunchang.__version__}. "
+                    f"Falling back to {'FLASH_ATTN' if HAS_FLASH_ATTN else 'TORCH'} attention."
+                )
+            except:
+                logger.warning(
+                    "AttnType.AITER not available in yunchang. "
+                    f"Falling back to {'FLASH_ATTN' if HAS_FLASH_ATTN else 'TORCH'} attention."
+                )
+            if HAS_FLASH_ATTN:
+                self.hybrid_seq_parallel_attn = xFuserLongContextAttention(
+                        use_kv_cache=self.use_long_ctx_attn_kvcache,
+                        attn_type=AttnType.FA,
+                )
+            else:
+                self.hybrid_seq_parallel_attn = xFuserLongContextAttention(
+                        use_kv_cache=self.use_long_ctx_attn_kvcache,
+                        attn_type=AttnType.TORCH,
+                )
         elif HAS_FLASH_ATTN:
             self.hybrid_seq_parallel_attn = xFuserLongContextAttention(
                     use_kv_cache=self.use_long_ctx_attn_kvcache,
