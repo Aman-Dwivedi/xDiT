@@ -840,33 +840,32 @@ class PipelineGroupCoordinator(GroupCoordinator):
         """
 
         ops = []
+        uccl_comm = get_uccl_comm()
         if recv_prev:
             recv_prev_dim_tensor = torch.empty(
                 (1), device=self.device, dtype=torch.int64
             )
-            recv_prev_dim_op = torch.distributed.P2POp(
-                torch.distributed.irecv,
+            recv_prev_dim_op = uccl_comm.irecv(
                 recv_prev_dim_tensor,
-                self.prev_rank,
-                self.device_group,
-            )
+                src=self.prev_rank,
+                group=self.device_group,
+                )
             ops.append(recv_prev_dim_op)
 
         if tensor_send_to_next is not None:
             send_next_dim_tensor = torch.tensor(
                 tensor_send_to_next.dim(), device=self.device, dtype=torch.int64
             )
-            send_next_dim_op = torch.distributed.P2POp(
-                torch.distributed.isend,
+            send_next_dim_op = uccl_comm.isend(
                 send_next_dim_tensor,
-                self.next_rank,
-                self.device_group,
+                dst=self.next_rank,
+                group=self.device_group,
             )
             ops.append(send_next_dim_op)
 
         if len(ops) > 0:
-            reqs = torch.distributed.batch_isend_irecv(ops)
-            for req in reqs:
+            #reqs = torch.distributed.batch_isend_irecv(ops)
+            for req in ops:
                 req.wait()
 
         # To protect against race condition when using batch_isend_irecv().
@@ -879,11 +878,10 @@ class PipelineGroupCoordinator(GroupCoordinator):
             recv_prev_shape_tensor = torch.empty(
                 torch.Size(recv_prev_dim_tensor), device=self.device, dtype=torch.int64
             )
-            recv_prev_shape_op = torch.distributed.P2POp(
-                torch.distributed.irecv,
+            recv_prev_shape_op = uccl_comm.irecv(
                 recv_prev_shape_tensor,
-                self.prev_rank,
-                self.device_group,
+                src=self.prev_rank,
+                group=self.device_group,
             )
             ops.append(recv_prev_shape_op)
 
@@ -891,17 +889,16 @@ class PipelineGroupCoordinator(GroupCoordinator):
             send_next_shape_tensor = torch.tensor(
                 tensor_send_to_next.size(), device=self.device, dtype=torch.int64
             )
-            send_next_shape_op = torch.distributed.P2POp(
-                torch.distributed.isend,
+            send_next_shape_op = uccl_comm.isend(
                 send_next_shape_tensor,
-                self.next_rank,
-                self.device_group,
+                dst=self.next_rank,
+                group=self.device_group,
             )
             ops.append(send_next_shape_op)
 
         if len(ops) > 0:
-            reqs = torch.distributed.batch_isend_irecv(ops)
-            for req in reqs:
+            #reqs = torch.distributed.batch_isend_irecv(ops)
+            for req in ops:
                 req.wait()
 
         synchronize()

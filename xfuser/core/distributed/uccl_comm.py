@@ -100,7 +100,8 @@ class UCCLCommWrapper:
             raise RuntimeError(
                 "torch.distributed must be initialized before UCCL communication"
             )
-        
+        if dist.get_backend() != "gloo":
+            raise RuntimeError(f"Instead of gloo using {dist.get_backend()}")
         try:
             self._rank = dist.get_rank()
             self._world_size = dist.get_world_size()
@@ -116,8 +117,7 @@ class UCCLCommWrapper:
             # Use disable_uccl_intra=True to use NCCL for intra-node, UCCL only for inter-node RDMA
             collective.init_collective(
                 num_cpus=self._num_cpus, 
-                local_gpu_idx=self._local_gpu_idx,
-                disable_uccl_intra=True
+                local_gpu_idx=self._local_gpu_idx
             )
             
             self._initialized = True
@@ -210,6 +210,7 @@ class UCCLCommWrapper:
                     print(f"[Rank {self._rank}] UCCL RDMA SEND: {tensor.numel()} elements ({tensor.element_size() * tensor.numel() / 1024 / 1024:.2f} MB) to rank {dst}")
                     return UCCLTransferHandle(transfer_id_or_p2pop, tensor)
                 else:
+                    raise NotImplementedError("Should not be here")
                     # P2POp needs to be batched and executed to get a Work handle
                     # Execute it immediately as a single-op batch
                     # batch_isend_irecv returns a list of Work objects
@@ -277,6 +278,7 @@ class UCCLCommWrapper:
                     print(f"[Rank {self._rank}] UCCL RDMA RECV: {tensor.numel()} elements ({tensor.element_size() * tensor.numel() / 1024 / 1024:.2f} MB) from rank {src}")
                     return UCCLTransferHandle(transfer_id_or_p2pop, tensor)
                 else:
+                    raise NotImplementedError("Should not be here")
                     # P2POp needs to be batched and executed to get a Work handle
                     # Execute it immediately as a single-op batch
                     # batch_isend_irecv returns a list of Work objects
