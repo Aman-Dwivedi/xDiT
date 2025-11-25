@@ -116,8 +116,7 @@ class UCCLCommWrapper:
             # Use disable_uccl_intra=True to use NCCL for intra-node, UCCL only for inter-node RDMA
             collective.init_collective(
                 num_cpus=self._num_cpus, 
-                local_gpu_idx=self._local_gpu_idx,
-                disable_uccl_intra=True
+                local_gpu_idx=self._local_gpu_idx
             )
             
             self._initialized = True

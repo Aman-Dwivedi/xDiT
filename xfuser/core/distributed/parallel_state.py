@@ -219,7 +219,7 @@ def init_distributed_environment(
     backend: Optional[str] = None,
 ):
     if backend is None:
-        backend = envs.get_torch_distributed_backend()
+        backend = "gloo"#envs.get_torch_distributed_backend()
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
         world_size,
