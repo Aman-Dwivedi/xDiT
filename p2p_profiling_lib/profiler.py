@@ -36,10 +36,17 @@ class P2PProfiler:
     Usage:
         profiler = P2PProfiler(output_dir="./profiling_data", enabled=True)
         
-        # Profile a send operation
-        with profiler.profile_send(tensor, dst_rank, comm_type='uccl', sync_mode='async') as ctx:
+        # For synchronous operations (automatic completion tracking):
+        with profiler.profile_send(tensor, dst_rank, comm_type='uccl', sync_mode='sync'):
             # perform send operation
             pass
+        
+        # For asynchronous operations (manual completion tracking):
+        with profiler.profile_send(tensor, dst_rank, comm_type='uccl', sync_mode='async') as ctx:
+            handle = perform_async_send(tensor, dst_rank)
+            # ... other work ...
+            handle.wait()  # Wait for completion
+            ctx.complete()  # Record actual completion time
     """
     
     def __init__(self, output_dir: str = "./profiling_results", enabled: bool = True, node_rank: int = 0):
@@ -58,47 +65,16 @@ class P2PProfiler:
         self.current_rank = None
         
         if self.enabled:
-            # Archive old results before starting new run
-            self._archive_old_results()
-            
-            # Create output directory
-            os.makedirs(output_dir, exist_ok=True)
-            
+            # Create timestamped subdirectory for this run
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.raw_csv_path = os.path.join(output_dir, f"p2p_profiling_raw_{timestamp}.csv")
-            self.summary_csv_path = os.path.join(output_dir, f"p2p_profiling_summary_{timestamp}.csv")
+            self.run_dir = os.path.join(output_dir, timestamp)
+            os.makedirs(self.run_dir, exist_ok=True)
+            
+            self.raw_csv_path = os.path.join(self.run_dir, "p2p_profiling_raw.csv")
+            self.summary_csv_path = os.path.join(self.run_dir, "p2p_profiling_summary.csv")
             self._init_csv()
     
-    def _archive_old_results(self):
-        """Archive old profiling results to past_results directory."""
-        if not os.path.exists(self.output_dir):
-            return
-        
-        # Find all CSV files in output directory
-        csv_files = glob.glob(os.path.join(self.output_dir, "*.csv"))
-        
-        if not csv_files:
-            return  # No old results to archive
-        
-        # Create archive directory with timestamp
-        archive_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        parent_dir = os.path.dirname(os.path.abspath(self.output_dir))
-        archive_dir = os.path.join(parent_dir, "past_profiling_results", f"run_{archive_timestamp}")
-        os.makedirs(archive_dir, exist_ok=True)
-        
-        # Move all CSV files to archive
-        moved_count = 0
-        for csv_file in csv_files:
-            try:
-                filename = os.path.basename(csv_file)
-                dest_path = os.path.join(archive_dir, filename)
-                shutil.move(csv_file, dest_path)
-                moved_count += 1
-            except Exception as e:
-                print(f"[P2P Profiler] Warning: Failed to move {csv_file}: {e}")
-        
-        if moved_count > 0:
-            print(f"[P2P Profiler] Archived {moved_count} old result file(s) to: {archive_dir}")
+
 
     
     def _init_csv(self):
@@ -129,45 +105,71 @@ class P2PProfiler:
             self.dst_rank = dst_rank
             self.start_time = None
             self.record = None
+            self.completed = False
         
         def __enter__(self):
             if self.profiler.enabled:
+                # Only record start time, don't synchronize here
+                # For async operations, we don't want to block at the start
                 self.start_time = time.perf_counter()
             return self
         
+        def complete(self):
+            """
+            Manually mark the operation as complete (for async operations).
+            Call this after waiting on the async handle.
+            Note: The caller should ensure the operation is actually complete
+            (e.g., by calling handle.wait()) before calling this method.
+            """
+            if not self.profiler.enabled or self.completed:
+                return
+            
+            self._record_completion(None, None, None)
+            self.completed = True
+        
         def __exit__(self, exc_type, exc_val, exc_tb):
-            if self.profiler.enabled:
-                duration_ms = (time.perf_counter() - self.start_time) * 1000
+            if self.profiler.enabled and not self.completed:
+                # For sync operations or if complete() wasn't called
+                # Only synchronize for sync operations
+                if self.sync_mode == 'sync' and self.tensor is not None and self.tensor.is_cuda:
+                    torch.cuda.synchronize(self.tensor.device)
                 
-                # Get tensor info
-                if self.tensor is not None:
-                    data_size = self.tensor.numel() * self.tensor.element_size()
-                    tensor_shape = str(tuple(self.tensor.shape))
-                    dtype = str(self.tensor.dtype)
-                else:
-                    data_size = 0
-                    tensor_shape = "unknown"
-                    dtype = "unknown"
-                
-                # Create record
-                record = TransferRecord(
-                    timestamp=self.start_time,
-                    operation=self.operation,
-                    comm_type=self.comm_type,
-                    sync_mode=self.sync_mode,
-                    data_size_bytes=data_size,
-                    duration_ms=duration_ms,
-                    src_rank=self.src_rank,
-                    dst_rank=self.dst_rank,
-                    tensor_shape=tensor_shape,
-                    dtype=dtype,
-                    success=(exc_type is None),
-                    error_msg=str(exc_val) if exc_val else ""
-                )
-                
-                self.profiler._record_transfer(record)
+                self._record_completion(exc_type, exc_val, exc_tb)
+                self.completed = True
             
             return False  # Don't suppress exceptions
+        
+        def _record_completion(self, exc_type, exc_val, exc_tb):
+            """Internal method to record the completion of the operation."""
+            duration_ms = (time.perf_counter() - self.start_time) * 1000
+            
+            # Get tensor info
+            if self.tensor is not None:
+                data_size = self.tensor.numel() * self.tensor.element_size()
+                tensor_shape = str(tuple(self.tensor.shape))
+                dtype = str(self.tensor.dtype)
+            else:
+                data_size = 0
+                tensor_shape = "unknown"
+                dtype = "unknown"
+            
+            # Create record
+            record = TransferRecord(
+                timestamp=self.start_time,
+                operation=self.operation,
+                comm_type=self.comm_type,
+                sync_mode=self.sync_mode,
+                data_size_bytes=data_size,
+                duration_ms=duration_ms,
+                src_rank=self.src_rank,
+                dst_rank=self.dst_rank,
+                tensor_shape=tensor_shape,
+                dtype=dtype,
+                success=(exc_type is None),
+                error_msg=str(exc_val) if exc_val else ""
+            )
+            
+            self.profiler._record_transfer(record)
     
     def profile_send(self, tensor: torch.Tensor, dst_rank: int, 
                      comm_type: str, sync_mode: str) -> ProfileContext:

@@ -24,6 +24,7 @@ import warnings
 from typing import Optional, Any
 import torch
 import torch.distributed as dist
+import threading
 
 # Import profiling library (now inside xDiT)
 try:
@@ -187,12 +188,25 @@ class UCCLCommWrapper:
         """
         profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
         comm_type = 'uccl' if self._enabled else 'nccl'
+        profile_ctx = None
         
         if profiler:
-            with profiler.profile_send(tensor, dst, comm_type=comm_type, sync_mode='async'):
-                if not self._enabled:
-                    return dist.isend(tensor, dst=dst, group=group)
+            profile_ctx = profiler.profile_send(tensor, dst, comm_type=comm_type, sync_mode='async')
+            profile_ctx.__enter__()
+        
+        try:
+            if not self._enabled:
+                # Ensure tensor is contiguous and synchronized (matching UCCL behavior)
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
                 
+                # Synchronize CUDA stream to ensure tensor data is ready
+                if tensor.is_cuda:
+                    torch.cuda.synchronize(tensor.device)
+                
+                handle = dist.isend(tensor, dst=dst, group=group)
+                wrapped = ProfiledWorkHandle(handle, profile_ctx, tensor) if profile_ctx else handle
+            else:
                 # Ensure tensor is contiguous and synchronized
                 if not tensor.is_contiguous():
                     tensor = tensor.contiguous()
@@ -208,41 +222,30 @@ class UCCLCommWrapper:
                 # When disable_uccl_intra=True, local transfers return P2POp, remote return int
                 if isinstance(transfer_id_or_p2pop, int):
                     print(f"[Rank {self._rank}] UCCL RDMA SEND: {tensor.numel()} elements ({tensor.element_size() * tensor.numel() / 1024 / 1024:.2f} MB) to rank {dst}")
-                    return UCCLTransferHandle(transfer_id_or_p2pop, tensor)
+                    wrapped = UCCLTransferHandle(transfer_id_or_p2pop, tensor, profile_ctx)
                 else:
                     # P2POp needs to be batched and executed to get a Work handle
                     # Execute it immediately as a single-op batch
                     # batch_isend_irecv returns a list of Work objects
                     print(f"[Rank {self._rank}] NCCL LOCAL SEND: {tensor.numel()} elements to rank {dst}")
                     work_list = dist.batch_isend_irecv([transfer_id_or_p2pop])
-                    return work_list[0]
-        else:
-            if not self._enabled:
-                return dist.isend(tensor, dst=dst, group=group)
-            
-            # Ensure tensor is contiguous and synchronized
-            if not tensor.is_contiguous():
-                tensor = tensor.contiguous()
-            
-            # Synchronize CUDA stream to ensure tensor data is ready
-            if tensor.is_cuda:
-                torch.cuda.synchronize(tensor.device)
-            
-            # Register tensor for RDMA if needed (collective API handles this intelligently)
-            collective.register_tensor(tensor)
-            transfer_id_or_p2pop = collective.isend(tensor, dst)
-            
-            # When disable_uccl_intra=True, local transfers return P2POp, remote return int
-            if isinstance(transfer_id_or_p2pop, int):
-                print(f"[Rank {self._rank}] UCCL RDMA SEND: {tensor.numel()} elements ({tensor.element_size() * tensor.numel() / 1024 / 1024:.2f} MB) to rank {dst}")
-                return UCCLTransferHandle(transfer_id_or_p2pop, tensor)
-            else:
-                # P2POp needs to be batched and executed to get a Work handle
-                # Execute it immediately as a single-op batch
-                # batch_isend_irecv returns a list of Work objects
-                print(f"[Rank {self._rank}] NCCL LOCAL SEND: {tensor.numel()} elements to rank {dst}")
-                work_list = dist.batch_isend_irecv([transfer_id_or_p2pop])
-                return work_list[0]
+                    wrapped = ProfiledWorkHandle(work_list[0], profile_ctx, tensor) if profile_ctx else work_list[0]
+
+            # Auto-wait in background to record end-to-end profiling for fire-and-forget sends
+            if profile_ctx is not None:
+                auto_wait_sends = os.environ.get("P2P_PROFILE_AUTOWAIT_SEND", "1") == "1"
+                if auto_wait_sends:
+                    def _bg_wait(h):
+                        try:
+                            h.wait()
+                        except Exception:
+                            pass
+                    threading.Thread(target=_bg_wait, args=(wrapped,), daemon=True).start()
+            return wrapped
+        except Exception as e:
+            if profile_ctx:
+                profile_ctx.__exit__(type(e), e, e.__traceback__)
+            raise
     
     def irecv(self, tensor: torch.Tensor, src: int, group=None) -> Any:
         """
@@ -258,34 +261,24 @@ class UCCLCommWrapper:
         """
         profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
         comm_type = 'uccl' if self._enabled else 'nccl'
+        profile_ctx = None
         
         if profiler:
-            with profiler.profile_recv(tensor, src, comm_type=comm_type, sync_mode='async'):
-                if not self._enabled:
-                    return dist.irecv(tensor, src=src, group=group)
-                
-                # Ensure tensor is contiguous
+            profile_ctx = profiler.profile_recv(tensor, src, comm_type=comm_type, sync_mode='async')
+            profile_ctx.__enter__()
+        
+        try:
+            if not self._enabled:
+                # Ensure tensor is contiguous (matching UCCL behavior)
                 if not tensor.is_contiguous():
                     raise RuntimeError("Receive tensor must be contiguous")
                 
-                # Register tensor for RDMA if needed (collective API handles this intelligently)
-                collective.register_tensor(tensor)
-                transfer_id_or_p2pop = collective.irecv(tensor, src)
+                # Synchronize CUDA stream before receiving
+                if tensor.is_cuda:
+                    torch.cuda.synchronize(tensor.device)
                 
-                # When disable_uccl_intra=True, local transfers return P2POp, remote return int
-                if isinstance(transfer_id_or_p2pop, int):
-                    print(f"[Rank {self._rank}] UCCL RDMA RECV: {tensor.numel()} elements ({tensor.element_size() * tensor.numel() / 1024 / 1024:.2f} MB) from rank {src}")
-                    return UCCLTransferHandle(transfer_id_or_p2pop, tensor)
-                else:
-                    # P2POp needs to be batched and executed to get a Work handle
-                    # Execute it immediately as a single-op batch
-                    # batch_isend_irecv returns a list of Work objects
-                    print(f"[Rank {self._rank}] NCCL LOCAL RECV: {tensor.numel()} elements from rank {src}")
-                    work_list = dist.batch_isend_irecv([transfer_id_or_p2pop])
-                    return work_list[0]
-        else:
-            if not self._enabled:
-                return dist.irecv(tensor, src=src, group=group)
+                handle = dist.irecv(tensor, src=src, group=group)
+                return ProfiledWorkHandle(handle, profile_ctx, tensor) if profile_ctx else handle
             
             # Ensure tensor is contiguous
             if not tensor.is_contiguous():
@@ -298,14 +291,18 @@ class UCCLCommWrapper:
             # When disable_uccl_intra=True, local transfers return P2POp, remote return int
             if isinstance(transfer_id_or_p2pop, int):
                 print(f"[Rank {self._rank}] UCCL RDMA RECV: {tensor.numel()} elements ({tensor.element_size() * tensor.numel() / 1024 / 1024:.2f} MB) from rank {src}")
-                return UCCLTransferHandle(transfer_id_or_p2pop, tensor)
+                return UCCLTransferHandle(transfer_id_or_p2pop, tensor, profile_ctx)
             else:
                 # P2POp needs to be batched and executed to get a Work handle
                 # Execute it immediately as a single-op batch
                 # batch_isend_irecv returns a list of Work objects
                 print(f"[Rank {self._rank}] NCCL LOCAL RECV: {tensor.numel()} elements from rank {src}")
                 work_list = dist.batch_isend_irecv([transfer_id_or_p2pop])
-                return work_list[0]
+                return ProfiledWorkHandle(work_list[0], profile_ctx, tensor) if profile_ctx else work_list[0]
+        except Exception as e:
+            if profile_ctx:
+                profile_ctx.__exit__(type(e), e, e.__traceback__)
+            raise
     
     def finalize(self):
         """Clean up UCCL resources."""
@@ -319,20 +316,64 @@ class UCCLCommWrapper:
 class UCCLTransferHandle:
     """Handle for UCCL transfers that mimics torch.distributed.Work interface."""
     
-    def __init__(self, transfer_id: int, tensor: torch.Tensor = None):
+    def __init__(self, transfer_id: int, tensor: torch.Tensor = None, profile_ctx=None):
         self.transfer_id = transfer_id
         self._tensor = tensor  # Keep reference to prevent GC during async transfer
+        self._profile_ctx = profile_ctx  # Keep reference to profiling context
+        self._waited = False
+        self._wait_lock = threading.Lock()
     
     def wait(self):
-        """Wait for the transfer to complete."""
-        collective.wait(self.transfer_id)
+        """Wait for the transfer to complete (idempotent)."""
+        with self._wait_lock:
+            if self._waited:
+                return
+            collective.wait(self.transfer_id)
+            self._waited = True
+        
         # Ensure GPU sees the completed data (especially important for receives)
         if self._tensor is not None and self._tensor.is_cuda:
             torch.cuda.synchronize(self._tensor.device)
+        # Record completion in profiler
+        if self._profile_ctx is not None:
+            self._profile_ctx.complete()
     
     def is_completed(self):
         """Check if the transfer has completed."""
         return collective.test(self.transfer_id)
+
+
+class ProfiledWorkHandle:
+    """Wrapper for torch.distributed.Work handle that records profiling completion."""
+    
+    def __init__(self, work, profile_ctx=None, tensor=None):
+        self._work = work
+        self._profile_ctx = profile_ctx
+        self._tensor = tensor  # Keep reference to tensor for post-wait synchronization
+        self._waited = False
+        self._wait_lock = threading.Lock()
+    
+    def wait(self):
+        """Wait for the work to complete (idempotent)."""
+        with self._wait_lock:
+            if self._waited:
+                return
+            self._work.wait()
+            self._waited = True
+        # Ensure GPU sees the completed data (matching UCCL behavior for fair comparison)
+        if self._tensor is not None and self._tensor.is_cuda:
+            torch.cuda.synchronize(self._tensor.device)
+        # Record completion in profiler
+        if self._profile_ctx is not None:
+            self._profile_ctx.complete()
+    
+    def is_completed(self):
+        """Check if the work has completed."""
+        return self._work.is_completed()
+    
+    def __getattr__(self, name):
+        """Forward other attributes to the wrapped work object."""
+        return getattr(self._work, name)
 
 
 # Global UCCL communication wrapper instance
