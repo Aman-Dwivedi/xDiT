@@ -838,73 +838,74 @@ class PipelineGroupCoordinator(GroupCoordinator):
             recv_prev: boolean for whether tensor should be received from
                        previous rank.
         """
+        uccl_comm = get_uccl_comm()
 
-        ops = []
+        recv_req = None
         if recv_prev:
             recv_prev_dim_tensor = torch.empty(
                 (1), device=self.device, dtype=torch.int64
             )
-            recv_prev_dim_op = torch.distributed.P2POp(
-                torch.distributed.irecv,
+            recv_req = uccl_comm.irecv(
                 recv_prev_dim_tensor,
-                self.prev_rank,
-                self.device_group,
+                src=self.prev_rank,
+                group=self.device_group,
             )
-            ops.append(recv_prev_dim_op)
 
+        send_req = None
         if tensor_send_to_next is not None:
             send_next_dim_tensor = torch.tensor(
                 tensor_send_to_next.dim(), device=self.device, dtype=torch.int64
             )
-            send_next_dim_op = torch.distributed.P2POp(
-                torch.distributed.isend,
+            send_req = uccl_comm.isend(
                 send_next_dim_tensor,
-                self.next_rank,
-                self.device_group,
+                dst=self.next_rank,
+                group=self.device_group,
             )
-            ops.append(send_next_dim_op)
 
-        if len(ops) > 0:
-            reqs = torch.distributed.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
+        if self.rank_in_group % 2 == 0:
+            if send_req:
+                send_req.wait()
+            if recv_req:
+                recv_req.wait()
+        else:
+            if recv_req:
+                recv_req.wait()
+            if send_req:
+                send_req.wait()
 
-        # To protect against race condition when using batch_isend_irecv().
-        # should take this out once the bug with batch_isend_irecv is resolved.
-        synchronize()
-
-        ops = []
+        recv_req = None
         recv_prev_shape_tensor = None
         if recv_prev:
             recv_prev_shape_tensor = torch.empty(
                 torch.Size(recv_prev_dim_tensor), device=self.device, dtype=torch.int64
             )
-            recv_prev_shape_op = torch.distributed.P2POp(
-                torch.distributed.irecv,
+            recv_req = uccl_comm.irecv(
                 recv_prev_shape_tensor,
-                self.prev_rank,
-                self.device_group,
+                src=self.prev_rank,
+                group=self.device_group,
             )
-            ops.append(recv_prev_shape_op)
 
+        send_req = None
         if tensor_send_to_next is not None:
             send_next_shape_tensor = torch.tensor(
                 tensor_send_to_next.size(), device=self.device, dtype=torch.int64
             )
-            send_next_shape_op = torch.distributed.P2POp(
-                torch.distributed.isend,
+            send_req = uccl_comm.isend(
                 send_next_shape_tensor,
-                self.next_rank,
-                self.device_group,
+                dst=self.next_rank,
+                group=self.device_group,
             )
-            ops.append(send_next_shape_op)
 
-        if len(ops) > 0:
-            reqs = torch.distributed.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
-
-        synchronize()
+        if self.rank_in_group % 2 == 0:
+            if send_req:
+                send_req.wait()
+            if recv_req:
+                recv_req.wait()
+        else:
+            if recv_req:
+                recv_req.wait()
+            if send_req:
+                send_req.wait()
 
         recv_prev_shape = [0, 0, 0]
         if recv_prev_shape_tensor is not None:
