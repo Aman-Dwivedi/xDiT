@@ -188,9 +188,15 @@ class UCCLCommWrapper:
         comm_type = 'uccl' if self._enabled else 'nccl'
         
         if profiler:
-            with profiler.profile_send(tensor, dst, comm_type=comm_type, sync_mode='async'):
+            # Create profiling context to start timing, but defer recording until wait()
+            profiling_ctx = profiler.profile_send(tensor, dst, comm_type=comm_type, sync_mode='async')
+            profiling_ctx.__enter__()  # Start timing
+            
+            try:
                 if not self._enabled:
-                    return dist.isend(tensor, dst=dst, group=group)
+                    handle = dist.isend(tensor, dst=dst, group=group)
+                    profiling_ctx.__exit__(None, None, None)
+                    return handle
                 
                 # Ensure tensor is contiguous and synchronized
                 if not tensor.is_contiguous():
@@ -207,14 +213,22 @@ class UCCLCommWrapper:
                 # When disable_uccl_intra=True, local transfers return P2POp, remote return int
                 if isinstance(transfer_id_or_p2pop, int):
                     print(f"[Rank {self._rank}] UCCL RDMA SEND: {tensor.numel()} elements ({tensor.element_size() * tensor.numel() / 1024 / 1024:.2f} MB) to rank {dst}")
-                    return UCCLTransferHandle(transfer_id_or_p2pop, tensor)
+                    # Pass profiling context to handle for deferred recording in wait()
+                    handle = UCCLTransferHandle(transfer_id_or_p2pop, tensor, profiling_context=profiling_ctx)
+                    # Exit context without recording (will be recorded in wait())
+                    profiling_ctx.__exit__(None, None, None)
+                    return handle
                 else:
                     # P2POp needs to be batched and executed to get a Work handle
                     # Execute it immediately as a single-op batch
                     # batch_isend_irecv returns a list of Work objects
                     print(f"[Rank {self._rank}] NCCL LOCAL SEND: {tensor.numel()} elements to rank {dst}")
                     work_list = dist.batch_isend_irecv([transfer_id_or_p2pop])
+                    profiling_ctx.__exit__(None, None, None)
                     return work_list[0]
+            except Exception as e:
+                profiling_ctx.__exit__(type(e), e, None)
+                raise
         else:
             if not self._enabled:
                 return dist.isend(tensor, dst=dst, group=group)
@@ -259,9 +273,14 @@ class UCCLCommWrapper:
         comm_type = 'uccl' if self._enabled else 'nccl'
         
         if profiler:
-            with profiler.profile_recv(tensor, src, comm_type=comm_type, sync_mode='async'):
+            profiling_ctx = profiler.profile_recv(tensor, src, comm_type=comm_type, sync_mode='async')
+            profiling_ctx.__enter__()  # Start timing
+            
+            try:
                 if not self._enabled:
-                    return dist.irecv(tensor, src=src, group=group)
+                    handle = dist.irecv(tensor, src=src, group=group)
+                    profiling_ctx.__exit__(None, None, None)
+                    return handle
                 
                 # Ensure tensor is contiguous
                 if not tensor.is_contiguous():
@@ -274,14 +293,20 @@ class UCCLCommWrapper:
                 # When disable_uccl_intra=True, local transfers return P2POp, remote return int
                 if isinstance(transfer_id_or_p2pop, int):
                     print(f"[Rank {self._rank}] UCCL RDMA RECV: {tensor.numel()} elements ({tensor.element_size() * tensor.numel() / 1024 / 1024:.2f} MB) from rank {src}")
-                    return UCCLTransferHandle(transfer_id_or_p2pop, tensor)
+                    handle = UCCLTransferHandle(transfer_id_or_p2pop, tensor, profiling_context=profiling_ctx)
+                    profiling_ctx.__exit__(None, None, None)
+                    return handle
                 else:
                     # P2POp needs to be batched and executed to get a Work handle
                     # Execute it immediately as a single-op batch
                     # batch_isend_irecv returns a list of Work objects
                     print(f"[Rank {self._rank}] NCCL LOCAL RECV: {tensor.numel()} elements from rank {src}")
                     work_list = dist.batch_isend_irecv([transfer_id_or_p2pop])
+                    profiling_ctx.__exit__(None, None, None)
                     return work_list[0]
+            except Exception as e:
+                profiling_ctx.__exit__(type(e), e, None)
+                raise
         else:
             if not self._enabled:
                 return dist.irecv(tensor, src=src, group=group)
@@ -318,16 +343,28 @@ class UCCLCommWrapper:
 class UCCLTransferHandle:
     """Handle for UCCL transfers that mimics torch.distributed.Work interface."""
     
-    def __init__(self, transfer_id: int, tensor: torch.Tensor = None):
+    def __init__(self, transfer_id: int, tensor: torch.Tensor = None, profiling_context = None):
         self.transfer_id = transfer_id
         self._tensor = tensor  # Keep reference to prevent GC during async transfer
+        self._profiling_context = profiling_context
     
     def wait(self):
         """Wait for the transfer to complete."""
-        collective.wait(self.transfer_id)
-        # Ensure GPU sees the completed data (especially important for receives)
-        if self._tensor is not None and self._tensor.is_cuda:
-            torch.cuda.synchronize(self._tensor.device)
+        success = True
+        error_msg = ""
+        try:
+            collective.wait(self.transfer_id)
+            # Ensure GPU sees the completed data (especially important for receives)
+            if self._tensor is not None and self._tensor.is_cuda:
+                torch.cuda.synchronize(self._tensor.device)
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            raise
+        finally:
+            # Record profiling data for async operations (dispatch to wait time)
+            if self._profiling_context is not None:
+                self._profiling_context.record_completion(success=success, error_msg=error_msg)
     
     def is_completed(self):
         """Check if the transfer has completed."""

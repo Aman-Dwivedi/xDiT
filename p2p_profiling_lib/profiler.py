@@ -129,14 +129,19 @@ class P2PProfiler:
             self.dst_rank = dst_rank
             self.start_time = None
             self.record = None
+            self._defer_recording = False  # For async operations, defer recording until wait()
         
         def __enter__(self):
             if self.profiler.enabled:
                 self.start_time = time.perf_counter()
+                # For async operations, defer recording until wait() is called
+                if self.sync_mode == 'async':
+                    self._defer_recording = True
             return self
         
         def __exit__(self, exc_type, exc_val, exc_tb):
-            if self.profiler.enabled:
+            # For async operations, don't record here - will be recorded in wait()
+            if self.profiler.enabled and not self._defer_recording:
                 duration_ms = (time.perf_counter() - self.start_time) * 1000
                 
                 # Get tensor info
@@ -168,6 +173,70 @@ class P2PProfiler:
                 self.profiler._record_transfer(record)
             
             return False  # Don't suppress exceptions
+        
+        def get_profiling_info(self):
+            """Get profiling information for deferred recording (used for async operations)."""
+            if not self.profiler.enabled or self.start_time is None:
+                return None
+            
+            # Get tensor info
+            if self.tensor is not None:
+                data_size = self.tensor.numel() * self.tensor.element_size()
+                tensor_shape = str(tuple(self.tensor.shape))
+                dtype = str(self.tensor.dtype)
+            else:
+                data_size = 0
+                tensor_shape = "unknown"
+                dtype = "unknown"
+            
+            return {
+                'start_time': self.start_time,
+                'operation': self.operation,
+                'comm_type': self.comm_type,
+                'sync_mode': self.sync_mode,
+                'data_size_bytes': data_size,
+                'src_rank': self.src_rank,
+                'dst_rank': self.dst_rank,
+                'tensor_shape': tensor_shape,
+                'dtype': dtype,
+                'profiler': self.profiler
+            }
+        
+        def record_completion(self, success: bool = True, error_msg: str = ""):
+            """Record the completion of an async operation (called from wait())."""
+            if not self.profiler.enabled or not self._defer_recording or self.start_time is None:
+                return
+            
+            end_time = time.perf_counter()
+            duration_ms = (end_time - self.start_time) * 1000
+            
+            # Get tensor info
+            if self.tensor is not None:
+                data_size = self.tensor.numel() * self.tensor.element_size()
+                tensor_shape = str(tuple(self.tensor.shape))
+                dtype = str(self.tensor.dtype)
+            else:
+                data_size = 0
+                tensor_shape = "unknown"
+                dtype = "unknown"
+            
+            # Create record
+            record = TransferRecord(
+                timestamp=self.start_time,
+                operation=self.operation,
+                comm_type=self.comm_type,
+                sync_mode=self.sync_mode,
+                data_size_bytes=data_size,
+                duration_ms=duration_ms,
+                src_rank=self.src_rank,
+                dst_rank=self.dst_rank,
+                tensor_shape=tensor_shape,
+                dtype=dtype,
+                success=success,
+                error_msg=error_msg
+            )
+            
+            self.profiler._record_transfer(record)
     
     def profile_send(self, tensor: torch.Tensor, dst_rank: int, 
                      comm_type: str, sync_mode: str) -> ProfileContext:

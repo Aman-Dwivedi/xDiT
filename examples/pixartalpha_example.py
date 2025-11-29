@@ -1,7 +1,9 @@
+import csv
 import time
 import os
 import torch
 import torch.distributed
+from datetime import datetime
 from transformers import T5EncoderModel
 from xfuser import xFuserPixArtAlphaPipeline, xFuserArgs
 from xfuser.config import FlexibleArgumentParser
@@ -159,6 +161,40 @@ def main():
         f"ulysses{engine_args.ulysses_degree}_ring{engine_args.ring_degree}_"
         f"pp{engine_args.pipefusion_parallel_degree}_patch{engine_args.num_pipeline_patch}_tc_{engine_args.use_torch_compile}"
     )
+    
+    if get_world_group().rank == get_world_group().world_size - 1:
+        total_epoch = phase_times.get('model_loading', 0) + elapsed_time
+        os.makedirs("profiling_results", exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join("profiling_results", f"pixart_phase_timings_{timestamp}.csv")
+        stage_rows = [
+            ("Model Loading", phase_times.get('model_loading', 0)),
+            ("Prompt Encoding", phase_times.get('prompt_encoding', 0)),
+            ("Latent Preparation", phase_times.get('latent_preparation', 0)),
+            ("Warmup Denoising", phase_times.get('warmup_denoising', 0)),
+            ("PipeFusion Denoising", phase_times.get('pipefusion_denoising', 0)),
+            ("VAE Decode & Post-process", phase_times.get('vae_decode_and_postprocess', 0)),
+            ("Total Inference Time", elapsed_time),
+            ("Total Epoch Time", total_epoch),
+        ]
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["metadata", "value"])
+            writer.writerow(["timestamp", timestamp])
+            writer.writerow(["model_path", engine_config.model_config.model])
+            writer.writerow(["parallel_config", parallel_info])
+            writer.writerow(["height", input_config.height])
+            writer.writerow(["width", input_config.width])
+            writer.writerow(["num_inference_steps", input_config.num_inference_steps])
+            writer.writerow(["batch_size", input_config.batch_size])
+            writer.writerow(["model_memory_gb", f"{model_memory/1e9:.4f}"])
+            writer.writerow(["peak_memory_gb", f"{peak_memory/1e9:.4f}"])
+            writer.writerow([])
+            writer.writerow(["stage", "duration_sec", "percent_of_epoch"])
+            for stage, duration in stage_rows:
+                percent = (duration / total_epoch * 100) if total_epoch > 0 else 0.0
+                writer.writerow([stage, f"{duration:.6f}", f"{percent:.2f}"])
+        print(f"[PixArt Profiling] Per-phase timings saved to {csv_path}")
     if input_config.output_type == "pil":
         dp_group_index = get_data_parallel_rank()
         num_dp_groups = get_data_parallel_world_size()
