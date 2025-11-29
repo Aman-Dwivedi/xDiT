@@ -334,6 +334,12 @@ class UCCLTransferHandle:
         # Ensure GPU sees the completed data (especially important for receives)
         if self._tensor is not None and self._tensor.is_cuda:
             torch.cuda.synchronize(self._tensor.device)
+        # Deregister the tensor for UCCL RDMA transfers after sync and before profiling completion
+        if self._tensor is not None:
+            try:
+                collective.deregister_tensor(self._tensor)
+            except Exception:
+                pass
         # Record completion in profiler
         if self._profile_ctx is not None:
             self._profile_ctx.complete()
