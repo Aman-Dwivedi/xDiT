@@ -228,11 +228,7 @@ class UCCLCommWrapper:
                     # Execute it immediately as a single-op batch
                     # batch_isend_irecv returns a list of Work objects
                     print(f"[Rank {self._rank}] UCCL LOCAL SEND: {tensor.numel()} elements to rank {dst}")
-                    if transfer_id_or_p2pop.op == dist.isend:
-                       temp = dist.isend(transfer_id_or_p2pop.tensor, transfer_id_or_p2pop.peer, transfer_id_or_p2pop.group, transfer_id_or_p2pop.tag)
-                    else:
-                      raise RuntimeError("Dikkat")
-                      work_list = dist.batch_isend_irecv([transfer_id_or_p2pop])
+                    temp = dist.isend(transfer_id_or_p2pop.tensor, transfer_id_or_p2pop.peer, transfer_id_or_p2pop.group, transfer_id_or_p2pop.tag)
                     wrapped = ProfiledWorkHandle(temp, profile_ctx, tensor) if profile_ctx else temp
 
             # Auto-wait in background to record end-to-end profiling for fire-and-forget sends
@@ -301,11 +297,7 @@ class UCCLCommWrapper:
                 # Execute it immediately as a single-op batch
                 # batch_isend_irecv returns a list of Work objects
                 print(f"[Rank {self._rank}] UCCL LOCAL RECV: {tensor.numel()} elements from rank {src}")
-                if transfer_id_or_p2pop.op == dist.irecv:
-                  temp = dist.irecv(transfer_id_or_p2pop.tensor, transfer_id_or_p2pop.peer, transfer_id_or_p2pop.group, transfer_id_or_p2pop.tag)
-                else:
-                  raise RuntimeError("Wapisi Dikkat")
-                  work_list = dist.batch_isend_irecv([transfer_id_or_p2pop])
+                temp = dist.irecv(transfer_id_or_p2pop.tensor, transfer_id_or_p2pop.peer, transfer_id_or_p2pop.group, transfer_id_or_p2pop.tag)
                 return ProfiledWorkHandle(temp, profile_ctx, tensor) if profile_ctx else temp
         except Exception as e:
             if profile_ctx:
