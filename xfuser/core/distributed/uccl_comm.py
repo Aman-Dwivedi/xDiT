@@ -20,6 +20,7 @@ Environment Variables:
 from __future__ import annotations
 import os
 import sys
+import time
 import warnings
 from typing import Optional, Any
 import torch
@@ -140,14 +141,28 @@ class UCCLCommWrapper:
         profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
         comm_type = 'uccl' if self._enabled else 'nccl'
         
+        # Synchronize CUDA stream BEFORE profiling to isolate communication latency
+        if tensor.is_cuda:
+            torch.cuda.synchronize(tensor.device)
+        
         if profiler:
-            with profiler.profile_send(tensor, dst, comm_type=comm_type, sync_mode='sync'):
+            profiling_ctx = profiler.profile_send(tensor, dst, comm_type=comm_type, sync_mode='sync')
+            with profiling_ctx:
                 if not self._enabled:
                     return dist.send(tensor, dst=dst, group=group)
+                
+                # Measure registration time separately for UCCL
+                reg_start = time.perf_counter()
+                collective.register_tensor(tensor)
+                reg_end = time.perf_counter()
+                registration_ms = (reg_end - reg_start) * 1000
+                profiling_ctx.set_registration_time(registration_ms)
+                
                 collective.send(tensor, dst)
         else:
             if not self._enabled:
                 return dist.send(tensor, dst=dst, group=group)
+            collective.register_tensor(tensor)
             collective.send(tensor, dst)
     
     def recv(self, tensor: torch.Tensor, src: int, group=None):
@@ -162,14 +177,28 @@ class UCCLCommWrapper:
         profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
         comm_type = 'uccl' if self._enabled else 'nccl'
         
+        # Synchronize CUDA stream BEFORE profiling to isolate communication latency
+        if tensor.is_cuda:
+            torch.cuda.synchronize(tensor.device)
+        
         if profiler:
-            with profiler.profile_recv(tensor, src, comm_type=comm_type, sync_mode='sync'):
+            profiling_ctx = profiler.profile_recv(tensor, src, comm_type=comm_type, sync_mode='sync')
+            with profiling_ctx:
                 if not self._enabled:
                     return dist.recv(tensor, src=src, group=group)
+                
+                # Measure registration time separately for UCCL
+                reg_start = time.perf_counter()
+                collective.register_tensor(tensor)
+                reg_end = time.perf_counter()
+                registration_ms = (reg_end - reg_start) * 1000
+                profiling_ctx.set_registration_time(registration_ms)
+                
                 collective.recv(tensor, src)
         else:
             if not self._enabled:
                 return dist.recv(tensor, src=src, group=group)
+            collective.register_tensor(tensor)
             collective.recv(tensor, src)
     
     def isend(self, tensor: torch.Tensor, dst: int, group=None) -> Any:
@@ -187,6 +216,14 @@ class UCCLCommWrapper:
         profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
         comm_type = 'uccl' if self._enabled else 'nccl'
         
+        # Ensure tensor is contiguous
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+        
+        # Synchronize CUDA stream BEFORE profiling to isolate communication latency
+        if tensor.is_cuda:
+            torch.cuda.synchronize(tensor.device)
+        
         if profiler:
             # Create profiling context to start timing, but defer recording until wait()
             profiling_ctx = profiler.profile_send(tensor, dst, comm_type=comm_type, sync_mode='async')
@@ -194,20 +231,21 @@ class UCCLCommWrapper:
             
             try:
                 if not self._enabled:
-                    handle = dist.isend(tensor, dst=dst, group=group)
+                    print(f"[Rank {self._rank}] NCCL SEND: {tensor.numel()} elements to rank {dst}")
+                    raw_handle = dist.isend(tensor, dst=dst, group=group)
+                    
+                    handle = TorchWorkWrapper(raw_handle, profiling_ctx)
+                    
                     profiling_ctx.__exit__(None, None, None)
                     return handle
                 
-                # Ensure tensor is contiguous and synchronized
-                if not tensor.is_contiguous():
-                    tensor = tensor.contiguous()
-                
-                # Synchronize CUDA stream to ensure tensor data is ready
-                if tensor.is_cuda:
-                    torch.cuda.synchronize(tensor.device)
-                
-                # Register tensor for RDMA if needed (collective API handles this intelligently)
+                # Measure registration time separately for UCCL
+                reg_start = time.perf_counter()
                 collective.register_tensor(tensor)
+                reg_end = time.perf_counter()
+                registration_ms = (reg_end - reg_start) * 1000
+                profiling_ctx.set_registration_time(registration_ms)
+                
                 transfer_id_or_p2pop = collective.isend(tensor, dst)
                 
                 # When disable_uccl_intra=True, local transfers return P2POp, remote return int
@@ -219,27 +257,21 @@ class UCCLCommWrapper:
                     profiling_ctx.__exit__(None, None, None)
                     return handle
                 else:
-                    # P2POp needs to be batched and executed to get a Work handle
-                    # Execute it immediately as a single-op batch
-                    # batch_isend_irecv returns a list of Work objects
                     print(f"[Rank {self._rank}] NCCL LOCAL SEND: {tensor.numel()} elements to rank {dst}")
                     work_list = dist.batch_isend_irecv([transfer_id_or_p2pop])
+                    
+                    # WRAP the handle so wait() triggers profiling
+                    handle = TorchWorkWrapper(work_list[0], profiling_ctx)
+                    
+                    # Exit the context (dispatch is done), but the wrapper holds the ctx for wait()
                     profiling_ctx.__exit__(None, None, None)
-                    return work_list[0]
+                    return handle
             except Exception as e:
                 profiling_ctx.__exit__(type(e), e, None)
                 raise
         else:
             if not self._enabled:
                 return dist.isend(tensor, dst=dst, group=group)
-            
-            # Ensure tensor is contiguous and synchronized
-            if not tensor.is_contiguous():
-                tensor = tensor.contiguous()
-            
-            # Synchronize CUDA stream to ensure tensor data is ready
-            if tensor.is_cuda:
-                torch.cuda.synchronize(tensor.device)
             
             # Register tensor for RDMA if needed (collective API handles this intelligently)
             collective.register_tensor(tensor)
@@ -272,22 +304,35 @@ class UCCLCommWrapper:
         profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
         comm_type = 'uccl' if self._enabled else 'nccl'
         
+        # Ensure tensor is contiguous
+        if not tensor.is_contiguous():
+            raise RuntimeError("Receive tensor must be contiguous")
+        
+        # Synchronize CUDA stream BEFORE profiling to isolate communication latency
+        if tensor.is_cuda:
+            torch.cuda.synchronize(tensor.device)
+        
         if profiler:
             profiling_ctx = profiler.profile_recv(tensor, src, comm_type=comm_type, sync_mode='async')
             profiling_ctx.__enter__()  # Start timing
             
             try:
                 if not self._enabled:
-                    handle = dist.irecv(tensor, src=src, group=group)
+                    print(f"[Rank {self._rank}] NCCL RECV: {tensor.numel()} elements from rank {src}")
+                    raw_handle = dist.irecv(tensor, src=src, group=group)
+                    
+                    handle = TorchWorkWrapper(raw_handle, profiling_ctx)
+
                     profiling_ctx.__exit__(None, None, None)
                     return handle
                 
-                # Ensure tensor is contiguous
-                if not tensor.is_contiguous():
-                    raise RuntimeError("Receive tensor must be contiguous")
-                
-                # Register tensor for RDMA if needed (collective API handles this intelligently)
+                # Measure registration time separately for UCCL
+                reg_start = time.perf_counter()
                 collective.register_tensor(tensor)
+                reg_end = time.perf_counter()
+                registration_ms = (reg_end - reg_start) * 1000
+                profiling_ctx.set_registration_time(registration_ms)
+                
                 transfer_id_or_p2pop = collective.irecv(tensor, src)
                 
                 # When disable_uccl_intra=True, local transfers return P2POp, remote return int
@@ -297,23 +342,20 @@ class UCCLCommWrapper:
                     profiling_ctx.__exit__(None, None, None)
                     return handle
                 else:
-                    # P2POp needs to be batched and executed to get a Work handle
-                    # Execute it immediately as a single-op batch
-                    # batch_isend_irecv returns a list of Work objects
                     print(f"[Rank {self._rank}] NCCL LOCAL RECV: {tensor.numel()} elements from rank {src}")
                     work_list = dist.batch_isend_irecv([transfer_id_or_p2pop])
+                    
+                    # WRAP the handle
+                    handle = TorchWorkWrapper(work_list[0], profiling_ctx)
+                    
                     profiling_ctx.__exit__(None, None, None)
-                    return work_list[0]
+                    return handle
             except Exception as e:
                 profiling_ctx.__exit__(type(e), e, None)
                 raise
         else:
             if not self._enabled:
                 return dist.irecv(tensor, src=src, group=group)
-            
-            # Ensure tensor is contiguous
-            if not tensor.is_contiguous():
-                raise RuntimeError("Receive tensor must be contiguous")
             
             # Register tensor for RDMA if needed (collective API handles this intelligently)
             collective.register_tensor(tensor)
@@ -339,6 +381,24 @@ class UCCLCommWrapper:
             self._enabled = False
             print(f"[Rank {self._rank}] UCCL collective communication finalized")
 
+class TorchWorkWrapper:
+    """Wrapper for torch.distributed.Work handles to enable profiling completion."""
+    def __init__(self, work_handle, profiling_context):
+        self.work = work_handle
+        self.ctx = profiling_context
+
+    def wait(self):
+        try:
+            self.work.wait()
+            if self.ctx: 
+                self.ctx.record_completion(success=True)
+        except Exception as e:
+            if self.ctx: 
+                self.ctx.record_completion(success=False, error_msg=str(e))
+            raise
+
+    def is_completed(self):
+        return self.work.is_completed()
 
 class UCCLTransferHandle:
     """Handle for UCCL transfers that mimics torch.distributed.Work interface."""

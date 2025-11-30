@@ -41,8 +41,10 @@ def compile_stats(raw_csv_path: str, summary_csv_path: str):
         'nccl_recv_async': 0,
         'total_data_bytes': 0,
         'total_duration_ms': 0,
+        'total_registration_ms': 0,
         'failed_operations': 0,
         'avg_duration_ms': 0,
+        'avg_registration_ms': 0,
         'avg_data_size_mb': 0,
     }
     
@@ -51,7 +53,9 @@ def compile_stats(raw_csv_path: str, summary_csv_path: str):
         'count': 0,
         'total_bytes': 0,
         'total_duration_ms': 0,
+        'total_registration_ms': 0,
         'avg_duration_ms': 0,
+        'avg_registration_ms': 0,
         'avg_size_mb': 0
     })
     
@@ -61,11 +65,13 @@ def compile_stats(raw_csv_path: str, summary_csv_path: str):
         sync_mode = record['sync_mode']
         data_size = int(record['data_size_bytes'])
         duration = float(record['duration_ms'])
+        registration = float(record.get('registration_ms', 0))
         success = record['success'].lower() == 'true'
         
         # Update totals
         stats['total_data_bytes'] += data_size
         stats['total_duration_ms'] += duration
+        stats['total_registration_ms'] += registration
         
         if operation == 'send':
             stats['total_send'] += 1
@@ -84,15 +90,18 @@ def compile_stats(raw_csv_path: str, summary_csv_path: str):
         category_stats[category]['count'] += 1
         category_stats[category]['total_bytes'] += data_size
         category_stats[category]['total_duration_ms'] += duration
+        category_stats[category]['total_registration_ms'] += registration
     
     # Compute averages
     if stats['total_operations'] > 0:
         stats['avg_duration_ms'] = stats['total_duration_ms'] / stats['total_operations']
+        stats['avg_registration_ms'] = stats['total_registration_ms'] / stats['total_operations']
         stats['avg_data_size_mb'] = (stats['total_data_bytes'] / stats['total_operations']) / (1024 * 1024)
     
     for category, cat_stats in category_stats.items():
         if cat_stats['count'] > 0:
             cat_stats['avg_duration_ms'] = cat_stats['total_duration_ms'] / cat_stats['count']
+            cat_stats['avg_registration_ms'] = cat_stats['total_registration_ms'] / cat_stats['count']
             cat_stats['avg_size_mb'] = (cat_stats['total_bytes'] / cat_stats['count']) / (1024 * 1024)
     
     # Write summary
@@ -106,8 +115,10 @@ def compile_stats(raw_csv_path: str, summary_csv_path: str):
         writer.writerow(['Total Recv Operations', stats['total_recv']])
         writer.writerow(['Failed Operations', stats['failed_operations']])
         writer.writerow(['Total Data Transferred (MB)', f"{stats['total_data_bytes'] / (1024 * 1024):.2f}"])
-        writer.writerow(['Total Duration (ms)', f"{stats['total_duration_ms']:.2f}"])
-        writer.writerow(['Average Duration per Op (ms)', f"{stats['avg_duration_ms']:.2f}"])
+        writer.writerow(['Total Transfer Duration (ms)', f"{stats['total_duration_ms']:.2f}"])
+        writer.writerow(['Total Registration Duration (ms)', f"{stats['total_registration_ms']:.2f}"])
+        writer.writerow(['Average Transfer Duration per Op (ms)', f"{stats['avg_duration_ms']:.2f}"])
+        writer.writerow(['Average Registration Duration per Op (ms)', f"{stats['avg_registration_ms']:.2f}"])
         writer.writerow(['Average Data Size per Op (MB)', f"{stats['avg_data_size_mb']:.2f}"])
         writer.writerow([])
         
@@ -134,7 +145,7 @@ def compile_stats(raw_csv_path: str, summary_csv_path: str):
         
         # Detailed category statistics
         f.write("=== DETAILED CATEGORY STATISTICS ===\n")
-        writer.writerow(['Category', 'Count', 'Total Data (MB)', 'Avg Data (MB)', 'Total Duration (ms)', 'Avg Duration (ms)'])
+        writer.writerow(['Category', 'Count', 'Total Data (MB)', 'Avg Data (MB)', 'Total Transfer (ms)', 'Avg Transfer (ms)', 'Total Registration (ms)', 'Avg Registration (ms)'])
         
         for category in sorted(category_stats.keys()):
             cat_stats = category_stats[category]
@@ -144,7 +155,9 @@ def compile_stats(raw_csv_path: str, summary_csv_path: str):
                 f"{cat_stats['total_bytes'] / (1024 * 1024):.2f}",
                 f"{cat_stats['avg_size_mb']:.2f}",
                 f"{cat_stats['total_duration_ms']:.2f}",
-                f"{cat_stats['avg_duration_ms']:.2f}"
+                f"{cat_stats['avg_duration_ms']:.2f}",
+                f"{cat_stats['total_registration_ms']:.2f}",
+                f"{cat_stats['avg_registration_ms']:.2f}"
             ])
         
         writer.writerow([])
@@ -181,17 +194,28 @@ def compile_stats(raw_csv_path: str, summary_csv_path: str):
         nccl_duration = sum([category_stats[cat]['total_duration_ms'] 
                             for cat in category_stats.keys() if 'NCCL' in cat])
         
+        uccl_registration = sum([category_stats[cat]['total_registration_ms'] 
+                                for cat in category_stats.keys() if 'UCCL' in cat])
+        nccl_registration = sum([category_stats[cat]['total_registration_ms'] 
+                                for cat in category_stats.keys() if 'NCCL' in cat])
+        
         writer.writerow(['Total Data (MB)', 
                         f"{uccl_data / (1024 * 1024):.2f}", 
                         f"{nccl_data / (1024 * 1024):.2f}"])
-        writer.writerow(['Total Duration (ms)', 
+        writer.writerow(['Total Transfer Duration (ms)', 
                         f"{uccl_duration:.2f}", 
                         f"{nccl_duration:.2f}"])
+        writer.writerow(['Total Registration Duration (ms)', 
+                        f"{uccl_registration:.2f}", 
+                        f"{nccl_registration:.2f}"])
         
         if uccl_total > 0:
-            writer.writerow(['Avg Duration per Op (ms)', 
+            writer.writerow(['Avg Transfer per Op (ms)', 
                             f"{uccl_duration / uccl_total:.2f}", 
                             f"{nccl_duration / nccl_total:.2f}" if nccl_total > 0 else "N/A"])
+            writer.writerow(['Avg Registration per Op (ms)', 
+                            f"{uccl_registration / uccl_total:.2f}", 
+                            f"{nccl_registration / nccl_total:.2f}" if nccl_total > 0 else "N/A"])
     
     print(f"[P2P Profiler] Summary statistics compiled successfully")
     _print_summary(stats, uccl_total, nccl_total, uccl_sync, uccl_async, nccl_sync, nccl_async)
@@ -211,6 +235,8 @@ def _print_summary(stats: Dict, uccl_total: int, nccl_total: int,
     print(f"\nNCCL Operations: {nccl_total}")
     print(f"  Sync: {nccl_sync}, Async: {nccl_async}")
     print(f"\nTotal Data: {stats['total_data_bytes'] / (1024 * 1024):.2f} MB")
-    print(f"Total Duration: {stats['total_duration_ms']:.2f} ms")
-    print(f"Avg Duration: {stats['avg_duration_ms']:.2f} ms")
+    print(f"Total Transfer Duration: {stats['total_duration_ms']:.2f} ms")
+    print(f"Total Registration Duration: {stats['total_registration_ms']:.2f} ms")
+    print(f"Avg Transfer Duration: {stats['avg_duration_ms']:.2f} ms")
+    print(f"Avg Registration Duration: {stats['avg_registration_ms']:.2f} ms")
     print("="*60 + "\n")

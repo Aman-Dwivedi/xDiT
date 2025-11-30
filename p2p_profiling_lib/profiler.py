@@ -21,7 +21,8 @@ class TransferRecord:
     comm_type: str  # 'uccl' or 'nccl'
     sync_mode: str  # 'sync' or 'async'
     data_size_bytes: int
-    duration_ms: float
+    duration_ms: float  # Transfer time only (excludes registration)
+    registration_ms: float  # Memory registration time (0.0 for NCCL or when not applicable)
     src_rank: int
     dst_rank: int
     tensor_shape: str
@@ -106,7 +107,7 @@ class P2PProfiler:
         with open(self.raw_csv_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=[
                 'timestamp', 'operation', 'comm_type', 'sync_mode',
-                'data_size_bytes', 'duration_ms', 'src_rank', 'dst_rank',
+                'data_size_bytes', 'duration_ms', 'registration_ms', 'src_rank', 'dst_rank',
                 'tensor_shape', 'dtype', 'success', 'error_msg'
             ])
             writer.writeheader()
@@ -130,6 +131,7 @@ class P2PProfiler:
             self.start_time = None
             self.record = None
             self._defer_recording = False  # For async operations, defer recording until wait()
+            self.registration_ms = 0.0  # Registration time, set externally before __exit__ or record_completion
         
         def __enter__(self):
             if self.profiler.enabled:
@@ -142,7 +144,9 @@ class P2PProfiler:
         def __exit__(self, exc_type, exc_val, exc_tb):
             # For async operations, don't record here - will be recorded in wait()
             if self.profiler.enabled and not self._defer_recording:
-                duration_ms = (time.perf_counter() - self.start_time) * 1000
+                total_duration_ms = (time.perf_counter() - self.start_time) * 1000
+                # Subtract registration time to get transfer time
+                transfer_duration_ms = total_duration_ms - self.registration_ms
                 
                 # Get tensor info
                 if self.tensor is not None:
@@ -161,7 +165,8 @@ class P2PProfiler:
                     comm_type=self.comm_type,
                     sync_mode=self.sync_mode,
                     data_size_bytes=data_size,
-                    duration_ms=duration_ms,
+                    duration_ms=transfer_duration_ms,
+                    registration_ms=self.registration_ms,
                     src_rank=self.src_rank,
                     dst_rank=self.dst_rank,
                     tensor_shape=tensor_shape,
@@ -173,6 +178,10 @@ class P2PProfiler:
                 self.profiler._record_transfer(record)
             
             return False  # Don't suppress exceptions
+        
+        def set_registration_time(self, registration_ms: float):
+            """Set the registration time measured externally."""
+            self.registration_ms = registration_ms
         
         def get_profiling_info(self):
             """Get profiling information for deferred recording (used for async operations)."""
@@ -199,6 +208,7 @@ class P2PProfiler:
                 'dst_rank': self.dst_rank,
                 'tensor_shape': tensor_shape,
                 'dtype': dtype,
+                'registration_ms': self.registration_ms,
                 'profiler': self.profiler
             }
         
@@ -208,7 +218,9 @@ class P2PProfiler:
                 return
             
             end_time = time.perf_counter()
-            duration_ms = (end_time - self.start_time) * 1000
+            total_duration_ms = (end_time - self.start_time) * 1000
+            # Subtract registration time to get transfer time
+            transfer_duration_ms = total_duration_ms - self.registration_ms
             
             # Get tensor info
             if self.tensor is not None:
@@ -227,7 +239,8 @@ class P2PProfiler:
                 comm_type=self.comm_type,
                 sync_mode=self.sync_mode,
                 data_size_bytes=data_size,
-                duration_ms=duration_ms,
+                duration_ms=transfer_duration_ms,
+                registration_ms=self.registration_ms,
                 src_rank=self.src_rank,
                 dst_rank=self.dst_rank,
                 tensor_shape=tensor_shape,
@@ -277,7 +290,7 @@ class P2PProfiler:
         with open(self.raw_csv_path, 'a', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=[
                 'timestamp', 'operation', 'comm_type', 'sync_mode',
-                'data_size_bytes', 'duration_ms', 'src_rank', 'dst_rank',
+                'data_size_bytes', 'duration_ms', 'registration_ms', 'src_rank', 'dst_rank',
                 'tensor_shape', 'dtype', 'success', 'error_msg'
             ])
             writer.writerow(asdict(record))
