@@ -136,9 +136,13 @@ class P2PProfiler:
         def __enter__(self):
             if self.profiler.enabled:
                 self.start_time = time.perf_counter()
-                # For async operations, defer recording until wait() is called
-                if self.sync_mode == 'async':
+                
+                # Only defer Receives. 
+                # Sends recorded immediately to capture Dispatch/Registration overhead.
+                if self.sync_mode == 'async' and self.operation == 'recv':
                     self._defer_recording = True
+                else:
+                    self._defer_recording = False # Sends record immediately
             return self
         
         def __exit__(self, exc_type, exc_val, exc_tb):
