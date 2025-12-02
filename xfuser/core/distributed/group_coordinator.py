@@ -1015,11 +1015,6 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 self.device_group,
             )
             ops.append(recv_prev_dim_op)
-            if profiler:
-                dim_recv_ctx = profiler.profile_recv(
-                    recv_prev_dim_tensor, self.prev_rank, comm_type="batch_isend_irecv", sync_mode="async"
-                )
-                dim_recv_ctx.__enter__()
 
         if tensor_send_to_next is not None:
             send_next_dim_tensor = torch.tensor(
@@ -1032,13 +1027,21 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 self.device_group,
             )
             ops.append(send_next_dim_op)
-            if profiler:
-                dim_send_ctx = profiler.profile_send(
-                    send_next_dim_tensor, self.next_rank, comm_type="batch_isend_irecv", sync_mode="async"
-                )
-                dim_send_ctx.__enter__()
 
         if len(ops) > 0:
+            # Start profiling right before batch_isend_irecv call
+            if profiler:
+                if recv_prev:
+                    dim_recv_ctx = profiler.profile_recv(
+                        recv_prev_dim_tensor, self.prev_rank, comm_type="nccl_batch", sync_mode="async"
+                    )
+                    dim_recv_ctx.__enter__()
+                if tensor_send_to_next is not None:
+                    dim_send_ctx = profiler.profile_send(
+                        send_next_dim_tensor, self.next_rank, comm_type="nccl_batch", sync_mode="async"
+                    )
+                    dim_send_ctx.__enter__()
+            
             reqs = torch.distributed.batch_isend_irecv(ops)
             for req in reqs:
                 req.wait()
@@ -1074,11 +1077,6 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 self.device_group,
             )
             ops.append(recv_prev_shape_op)
-            if profiler:
-                shape_recv_ctx = profiler.profile_recv(
-                    recv_prev_shape_tensor, self.prev_rank, comm_type="batch_isend_irecv", sync_mode="async"
-                )
-                shape_recv_ctx.__enter__()
 
         if tensor_send_to_next is not None:
             send_next_shape_tensor = torch.tensor(
@@ -1091,13 +1089,21 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 self.device_group,
             )
             ops.append(send_next_shape_op)
-            if profiler:
-                shape_send_ctx = profiler.profile_send(
-                    send_next_shape_tensor, self.next_rank, comm_type="batch_isend_irecv", sync_mode="async"
-                )
-                shape_send_ctx.__enter__()
 
         if len(ops) > 0:
+            # Start profiling right before batch_isend_irecv call
+            if profiler:
+                if recv_prev:
+                    shape_recv_ctx = profiler.profile_recv(
+                        recv_prev_shape_tensor, self.prev_rank, comm_type="nccl_batch", sync_mode="async"
+                    )
+                    shape_recv_ctx.__enter__()
+                if tensor_send_to_next is not None:
+                    shape_send_ctx = profiler.profile_send(
+                        send_next_shape_tensor, self.next_rank, comm_type="nccl_batch", sync_mode="async"
+                    )
+                    shape_send_ctx.__enter__()
+            
             reqs = torch.distributed.batch_isend_irecv(ops)
             for req in reqs:
                 req.wait()
