@@ -10,3 +10,5 @@ profile/
 xfuser.egg-info/
 dist/*
 *.mp4
+profiling_results/
+p2p_profiling_lib/__pycache__/

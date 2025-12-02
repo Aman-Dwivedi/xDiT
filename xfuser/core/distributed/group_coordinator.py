@@ -5,6 +5,10 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 from collections import namedtuple
 from typing import Any, Dict, List, Optional, Tuple, Union
+import os
+import sys
+import threading
+import atexit
 import pickle
 
 import torch
@@ -32,6 +36,54 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
 HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
+
+# Optional P2P profiler (lives at xDiT/p2p_profiling_lib)
+try:
+    _xdit_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    )
+    if _xdit_root not in sys.path:
+        sys.path.insert(0, _xdit_root)
+    from p2p_profiling_lib import (
+        get_profiler,
+        enable_profiling,
+        disable_profiling,
+    )  # type: ignore
+
+    P2P_PROFILING_AVAILABLE = True
+except Exception:
+    P2P_PROFILING_AVAILABLE = False
+_P2P_PROF_ATEXIT_REGISTERED = False
+
+
+
+class _ProfiledWorkHandle:
+    """Wrapper for torch.distributed.Work to mark profiling completion on wait()."""
+
+    def __init__(self, work, profile_ctx=None, tensor: Optional[torch.Tensor] = None):
+        self._work = work
+        self._profile_ctx = profile_ctx
+        self._tensor = tensor
+        self._waited = False
+        self._wait_lock = threading.Lock()
+
+    def wait(self):
+        with self._wait_lock:
+            if self._waited:
+                return
+            self._work.wait()
+            self._waited = True
+        # Match reference behavior: ensure GPU sees completed data
+        if self._tensor is not None and isinstance(self._tensor, torch.Tensor) and self._tensor.is_cuda:
+            torch.cuda.synchronize(self._tensor.device)
+        if self._profile_ctx is not None:
+            self._profile_ctx.complete()
+
+    def is_completed(self):
+        return self._work.is_completed()
+
+    def __getattr__(self, name):
+        return getattr(self._work, name)
 
 
 def _split_tensor_dict(
@@ -142,6 +194,23 @@ class GroupCoordinator:
         assert self.device_group is not None
 
         self.device = envs.get_device(local_rank)
+
+        # Ensure profiler is enabled by default (node 0 by default)
+        if P2P_PROFILING_AVAILABLE:
+            try:
+                prof = get_profiler()
+                if prof is None:
+                    node_rank = int(os.environ.get("NODE_RANK", "0"))
+                    out_dir = os.environ.get("P2P_PROFILING_OUTPUT_DIR", "./profiling_results")
+                    prof = enable_profiling(output_dir=out_dir, node_rank=node_rank)
+                if prof is not None:
+                    prof.set_rank(self.rank)
+                global _P2P_PROF_ATEXIT_REGISTERED
+                if not _P2P_PROF_ATEXIT_REGISTERED:
+                    atexit.register(disable_profiling)
+                    _P2P_PROF_ATEXIT_REGISTERED = True
+            except Exception:
+                pass
 
     @property
     def first_rank(self):
@@ -367,11 +436,21 @@ class GroupCoordinator:
         )
 
         # Send object size
-
-        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
-
-        # Send object
-        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+        dst_global = self.ranks[dst]
+        if profiler:
+            with profiler.profile_send(
+                size_tensor, dst_global, comm_type="gloo", sync_mode="sync"
+            ):
+                torch.distributed.send(size_tensor, dst=dst_global, group=self.cpu_group)
+            with profiler.profile_send(
+                object_tensor, dst_global, comm_type="gloo", sync_mode="sync"
+            ):
+                torch.distributed.send(object_tensor, dst=dst_global, group=self.cpu_group)
+        else:
+            torch.distributed.send(size_tensor, dst=dst_global, group=self.cpu_group)
+            # Send object
+            torch.distributed.send(object_tensor, dst=dst_global, group=self.cpu_group)
 
         return None
 
@@ -388,9 +467,19 @@ class GroupCoordinator:
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
         # Receive object size
-        rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+        src_global = self.ranks[src]
+        if profiler:
+            with profiler.profile_recv(
+                size_tensor, src_global, comm_type="gloo", sync_mode="sync"
+            ):
+                rank_size = torch.distributed.recv(
+                    size_tensor, src=src_global, group=self.cpu_group
+                )
+        else:
+            rank_size = torch.distributed.recv(
+                size_tensor, src=src_global, group=self.cpu_group
+            )
 
         # Tensor to receive serialized objects into.
         object_tensor = torch.empty(  # type: ignore[call-overload]
@@ -399,9 +488,17 @@ class GroupCoordinator:
             device="cpu",
         )
 
-        rank_object = torch.distributed.recv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        if profiler:
+            with profiler.profile_recv(
+                object_tensor, src_global, comm_type="gloo", sync_mode="sync"
+            ):
+                rank_object = torch.distributed.recv(
+                    object_tensor, src=src_global, group=self.cpu_group
+                )
+        else:
+            rank_object = torch.distributed.recv(
+                object_tensor, src=src_global, group=self.cpu_group
+            )
 
         assert (
             rank_object == rank_size
@@ -525,12 +622,30 @@ class GroupCoordinator:
                 continue
             if tensor.is_cpu:
                 # use metadata_group for CPU tensors
-                torch.distributed.send(
-                    tensor, dst=self.ranks[dst], group=metadata_group
-                )
+                profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+                dst_global = self.ranks[dst]
+                if profiler:
+                    with profiler.profile_send(
+                        tensor, dst_global, comm_type="gloo", sync_mode="sync"
+                    ):
+                        torch.distributed.send(
+                            tensor, dst=dst_global, group=metadata_group
+                        )
+                else:
+                    torch.distributed.send(
+                        tensor, dst=dst_global, group=metadata_group
+                    )
             else:
                 # use group for GPU tensors
-                torch.distributed.send(tensor, dst=self.ranks[dst], group=group)
+                profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+                dst_global = self.ranks[dst]
+                if profiler:
+                    with profiler.profile_send(
+                        tensor, dst_global, comm_type="nccl", sync_mode="sync"
+                    ):
+                        torch.distributed.send(tensor, dst=dst_global, group=group)
+                else:
+                    torch.distributed.send(tensor, dst=dst_global, group=group)
         return None
 
     def recv_tensor_dict(
@@ -561,12 +676,30 @@ class GroupCoordinator:
                     continue
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
-                    torch.distributed.recv(
-                        tensor, src=self.ranks[src], group=metadata_group
-                    )
+                    profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+                    src_global = self.ranks[src]
+                    if profiler:
+                        with profiler.profile_recv(
+                            tensor, src_global, comm_type="gloo", sync_mode="sync"
+                        ):
+                            torch.distributed.recv(
+                                tensor, src=src_global, group=metadata_group
+                            )
+                    else:
+                        torch.distributed.recv(
+                            tensor, src=src_global, group=metadata_group
+                        )
                 else:
                     # use group for GPU tensors
-                    torch.distributed.recv(tensor, src=self.ranks[src], group=group)
+                    profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+                    src_global = self.ranks[src]
+                    if profiler:
+                        with profiler.profile_recv(
+                            tensor, src_global, comm_type="nccl", sync_mode="sync"
+                        ):
+                            torch.distributed.recv(tensor, src=src_global, group=group)
+                    else:
+                        torch.distributed.recv(tensor, src=src_global, group=group)
                 _update_nested_dict(tensor_dict, key, tensor)
             else:
                 _update_nested_dict(tensor_dict, key, value)
@@ -586,16 +719,21 @@ class GroupCoordinator:
         """NOTE: `dst` is the rank_in_group of the destination rank."""
         if dst is None:
             dst = self.group_next_rank
-
-        torch.distributed.send(
-            tensor,
-            self.ranks[dst],
-            group=(
-                self.device_groups[self.rank_in_group % 2]
-                if self.world_size == 2
-                else self.device_group
-            ),
+        group = (
+            self.device_groups[self.rank_in_group % 2]
+            if self.world_size == 2
+            else self.device_group
         )
+        profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+        dst_global = self.ranks[dst]
+        comm_type = "nccl"
+        if profiler:
+            with profiler.profile_send(
+                tensor, dst_global, comm_type=comm_type, sync_mode="sync"
+            ):
+                torch.distributed.send(tensor, dst_global, group=group)
+        else:
+            torch.distributed.send(tensor, dst_global, group=group)
 
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: Optional[int] = None
@@ -604,17 +742,22 @@ class GroupCoordinator:
         """NOTE: `src` is the rank_in_group of the source rank."""
         if src is None:
             src = self.group_prev_rank
-
-        tensor = torch.empty(size, dtype=dtype, device=self.device)
-        torch.distributed.recv(
-            tensor,
-            self.ranks[src],
-            (
-                self.device_groups[(self.rank_in_group + 1) % 2]
-                if self.world_size == 2
-                else self.device_group
-            ),
+        group = (
+            self.device_groups[(self.rank_in_group + 1) % 2]
+            if self.world_size == 2
+            else self.device_group
         )
+        tensor = torch.empty(size, dtype=dtype, device=self.device)
+        profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+        src_global = self.ranks[src]
+        comm_type = "nccl"
+        if profiler:
+            with profiler.profile_recv(
+                tensor, src_global, comm_type=comm_type, sync_mode="sync"
+            ):
+                torch.distributed.recv(tensor, src_global, group)
+        else:
+            torch.distributed.recv(tensor, src_global, group)
         return tensor
 
     def destroy(self):
@@ -702,6 +845,23 @@ class PipelineGroupCoordinator(GroupCoordinator):
         assert self.device_group is not None
 
         self.device = envs.get_device(local_rank)
+
+        # Ensure profiler is enabled by default (node 0 by default)
+        if P2P_PROFILING_AVAILABLE:
+            try:
+                prof = get_profiler()
+                if prof is None:
+                    node_rank = int(os.environ.get("NODE_RANK", "0"))
+                    out_dir = os.environ.get("P2P_PROFILING_OUTPUT_DIR", "./profiling_results")
+                    prof = enable_profiling(output_dir=out_dir, node_rank=node_rank)
+                if prof is not None:
+                    prof.set_rank(self.rank)
+                global _P2P_PROF_ATEXIT_REGISTERED
+                if not _P2P_PROF_ATEXIT_REGISTERED:
+                    atexit.register(disable_profiling)
+                    _P2P_PROF_ATEXIT_REGISTERED = True
+            except Exception:
+                pass
 
         self.recv_buffer_set: bool = False
         self.recv_tasks_queue: List[Tuple[str, int]] = []
@@ -840,6 +1000,10 @@ class PipelineGroupCoordinator(GroupCoordinator):
         """
 
         ops = []
+        # Optional profiling contexts for the first phase (dims)
+        profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+        dim_send_ctx = None
+        dim_recv_ctx = None
         if recv_prev:
             recv_prev_dim_tensor = torch.empty(
                 (1), device=self.device, dtype=torch.int64
@@ -851,6 +1015,11 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 self.device_group,
             )
             ops.append(recv_prev_dim_op)
+            if profiler:
+                dim_recv_ctx = profiler.profile_recv(
+                    recv_prev_dim_tensor, self.prev_rank, comm_type="batch_isend_irecv", sync_mode="async"
+                )
+                dim_recv_ctx.__enter__()
 
         if tensor_send_to_next is not None:
             send_next_dim_tensor = torch.tensor(
@@ -863,17 +1032,36 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 self.device_group,
             )
             ops.append(send_next_dim_op)
+            if profiler:
+                dim_send_ctx = profiler.profile_send(
+                    send_next_dim_tensor, self.next_rank, comm_type="batch_isend_irecv", sync_mode="async"
+                )
+                dim_send_ctx.__enter__()
 
         if len(ops) > 0:
             reqs = torch.distributed.batch_isend_irecv(ops)
             for req in reqs:
                 req.wait()
+            # Ensure device sees completion before profiling completion
+            if profiler:
+                try:
+                    synchronize()
+                except Exception:
+                    pass
+                if dim_send_ctx is not None:
+                    dim_send_ctx.complete()
+                if dim_recv_ctx is not None:
+                    dim_recv_ctx.complete()
 
         # To protect against race condition when using batch_isend_irecv().
         # should take this out once the bug with batch_isend_irecv is resolved.
         synchronize()
 
         ops = []
+        # Optional profiling contexts for the second phase (shapes)
+        profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+        shape_send_ctx = None
+        shape_recv_ctx = None
         recv_prev_shape_tensor = None
         if recv_prev:
             recv_prev_shape_tensor = torch.empty(
@@ -886,6 +1074,11 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 self.device_group,
             )
             ops.append(recv_prev_shape_op)
+            if profiler:
+                shape_recv_ctx = profiler.profile_recv(
+                    recv_prev_shape_tensor, self.prev_rank, comm_type="batch_isend_irecv", sync_mode="async"
+                )
+                shape_recv_ctx.__enter__()
 
         if tensor_send_to_next is not None:
             send_next_shape_tensor = torch.tensor(
@@ -898,11 +1091,25 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 self.device_group,
             )
             ops.append(send_next_shape_op)
+            if profiler:
+                shape_send_ctx = profiler.profile_send(
+                    send_next_shape_tensor, self.next_rank, comm_type="batch_isend_irecv", sync_mode="async"
+                )
+                shape_send_ctx.__enter__()
 
         if len(ops) > 0:
             reqs = torch.distributed.batch_isend_irecv(ops)
             for req in reqs:
                 req.wait()
+            if profiler:
+                try:
+                    synchronize()
+                except Exception:
+                    pass
+                if shape_send_ctx is not None:
+                    shape_send_ctx.complete()
+                if shape_recv_ctx is not None:
+                    shape_recv_ctx.complete()
 
         synchronize()
 
@@ -927,7 +1134,17 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self._check_shape_and_buffer(
             tensor_send_to_next=tensor, name=name, segment_idx=segment_idx
         )
-        self._pipeline_isend(tensor)
+        handle = self._pipeline_isend(tensor)
+        # If profiling is active and this is a fire-and-forget send, optionally auto-wait
+        if P2P_PROFILING_AVAILABLE and get_profiler() is not None and handle is not None:
+            autowait = os.environ.get("P2P_PROFILE_AUTOWAIT_SEND", "1") == "1"
+            if autowait:
+                def _bg_wait(h):
+                    try:
+                        h.wait()
+                    except Exception:
+                        pass
+                threading.Thread(target=_bg_wait, args=(handle,), daemon=True).start()
 
     def pipeline_recv(self, idx: int = -1, name: str = "latent") -> torch.Tensor:
         name = name or "latent"
@@ -963,26 +1180,39 @@ class PipelineGroupCoordinator(GroupCoordinator):
         return self.recv_buffer[name][idx]
 
     def _pipeline_irecv(self, tensor: torch.tensor):
-        return torch.distributed.irecv(
-            tensor,
-            src=self.prev_rank,
-            group=(
-                self.device_groups[(self.rank_in_group + 1) % 2]
-                if self.world_size == 2
-                else self.device_group
-            ),
+        group = (
+            self.device_groups[(self.rank_in_group + 1) % 2]
+            if self.world_size == 2
+            else self.device_group
         )
+        profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+        if profiler:
+            ctx = profiler.profile_recv(
+                tensor, self.prev_rank, comm_type="nccl", sync_mode="async"
+            )
+            ctx.__enter__()
+            work = torch.distributed.irecv(tensor, src=self.prev_rank, group=group)
+            return _ProfiledWorkHandle(work, ctx, tensor)
+        else:
+            return torch.distributed.irecv(tensor, src=self.prev_rank, group=group)
 
     def _pipeline_isend(self, tensor: torch.tensor):
-        return torch.distributed.isend(
-            tensor,
-            dst=self.next_rank,
-            group=(
-                self.device_groups[self.rank_in_group % 2]
-                if self.world_size == 2
-                else self.device_group
-            ),
+        group = (
+            self.device_groups[self.rank_in_group % 2]
+            if self.world_size == 2
+            else self.device_group
         )
+        profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+        if profiler:
+            ctx = profiler.profile_send(
+                tensor, self.next_rank, comm_type="nccl", sync_mode="async"
+            )
+            ctx.__enter__()
+            work = torch.distributed.isend(tensor, dst=self.next_rank, group=group)
+            wrapped = _ProfiledWorkHandle(work, ctx, tensor)
+            return wrapped
+        else:
+            return torch.distributed.isend(tensor, dst=self.next_rank, group=group)
 
     def set_skip_tensor_recv_buffer(
         self,
@@ -1004,7 +1234,16 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
     def pipeline_isend_skip(self, tensor: torch.Tensor) -> None:
         tensor = tensor.contiguous()
-        self._pipeline_isend_skip(tensor)
+        handle = self._pipeline_isend_skip(tensor)
+        if P2P_PROFILING_AVAILABLE and get_profiler() is not None and handle is not None:
+            autowait = os.environ.get("P2P_PROFILE_AUTOWAIT_SEND", "1") == "1"
+            if autowait:
+                def _bg_wait(h):
+                    try:
+                        h.wait()
+                    except Exception:
+                        pass
+                threading.Thread(target=_bg_wait, args=(handle,), daemon=True).start()
 
     def pipeline_recv_skip(self, idx: int = -1) -> torch.Tensor:
         self._pipeline_irecv_skip(self.skip_tensor_recv_buffer[idx]).wait()
@@ -1039,14 +1278,36 @@ class PipelineGroupCoordinator(GroupCoordinator):
             )
 
     def _pipeline_irecv_skip(self, tensor: torch.tensor):
-        return torch.distributed.irecv(
-            tensor, src=self.skip_rank, group=self.skip_device_group
-        )
+        profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+        if profiler:
+            ctx = profiler.profile_recv(
+                tensor, self.skip_rank, comm_type="nccl", sync_mode="async"
+            )
+            ctx.__enter__()
+            work = torch.distributed.irecv(
+                tensor, src=self.skip_rank, group=self.skip_device_group
+            )
+            return _ProfiledWorkHandle(work, ctx, tensor)
+        else:
+            return torch.distributed.irecv(
+                tensor, src=self.skip_rank, group=self.skip_device_group
+            )
 
     def _pipeline_isend_skip(self, tensor: torch.tensor):
-        return torch.distributed.isend(
-            tensor, dst=self.skip_rank, group=self.skip_device_group
-        )
+        profiler = get_profiler() if P2P_PROFILING_AVAILABLE else None
+        if profiler:
+            ctx = profiler.profile_send(
+                tensor, self.skip_rank, comm_type="nccl", sync_mode="async"
+            )
+            ctx.__enter__()
+            work = torch.distributed.isend(
+                tensor, dst=self.skip_rank, group=self.skip_device_group
+            )
+            return _ProfiledWorkHandle(work, ctx, tensor)
+        else:
+            return torch.distributed.isend(
+                tensor, dst=self.skip_rank, group=self.skip_device_group
+            )
 
 
 class SequenceParallelGroupCoordinator(GroupCoordinator):
