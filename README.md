@@ -1,3 +1,64 @@
+# xDiT Distributed Inference + UCCL P2P Setup Guide
+
+## Steps to Run
+
+### 1. Install Repositories (on any node)
+
+    git clone --recursive https://github.com/Aman-Dwivedi/xDiT.git
+    git clone --recursive https://github.com/Aman-Dwivedi/uccl.git
+    git clone --recursive https://github.com/ROCm/aiter.git
+
+### 2. Activate Predefined Environment on Dr. Zhou's AMD Cluster (on both nodes)
+
+    conda activate xdit
+
+### 3. Set Up AITer (on any node)
+
+    cd aiter
+    python3 setup.py develop
+
+### 4. Set Up UCCL (on any node)
+
+    cd uccl
+    bash build_and_install.sh rocm6 p2p 3.14
+
+### 5. Export Environment Variables
+
+#### Node 0
+
+    export USE_UCCL_P2P=1
+    export NCCL_IB_GID_INDEX=3
+    export UCCL_ENTROPY=2 
+    export UCCL_CHUNK_SIZE_KB=64
+    export ENABLE_P2P_PROFILING=1
+    export NODE_RANK=0
+
+#### Node 1
+
+    export USE_UCCL_P2P=1
+    export NCCL_IB_GID_INDEX=3
+    export UCCL_ENTROPY=2 
+    export UCCL_CHUNK_SIZE_KB=64
+    export ENABLE_P2P_PROFILING=1
+    export NODE_RANK=1
+
+### 6. Test with 8 GPUs/Node on 2 Nodes (Profiling Enabled)
+
+#### Node 0 Command
+
+    cd xDiT
+
+    torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=<INSERT_IP_ADDRESS_OF_NODE_0> --master_port=12355 examples/pixartalpha_example.py --model PixArt-alpha/PixArt-XL-2-1024-MS --pipefusion_parallel_degree 16 --num_inference_steps 20 --warmup_steps 1 --prompt "Bumblebee from transformers"
+
+#### Node 1 Command
+
+    cd xDiT
+
+    torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=<INSERT_IP_ADDRESS_OF_NODE_0> --master_port=12355 examples/pixartalpha_example.py --model PixArt-alpha/PixArt-XL-2-1024-MS --pipefusion_parallel_degree 16 --num_inference_steps 20 --warmup_steps 1 --prompt "Bumblebee from transformers"
+
+---
+
+
 <div align="center">
   <!-- <h1>KTransformers</h1> -->
   <p align="center">
