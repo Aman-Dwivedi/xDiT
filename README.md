@@ -42,6 +42,8 @@
     export ENABLE_P2P_PROFILING=1
     export NODE_RANK=1
 
+You can toggle ENABLE_P2P_PROFILING based on whether you want profiling enabled.
+
 ### 6. Test with 8 GPUs/Node on 2 Nodes (Profiling Enabled)
 
 #### Node 0 Command
@@ -55,6 +57,8 @@
     cd xDiT
 
     torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=<INSERT_IP_ADDRESS_OF_NODE_0> --master_port=12355 examples/pixartalpha_example.py --model PixArt-alpha/PixArt-XL-2-1024-MS --pipefusion_parallel_degree 16 --num_inference_steps 20 --warmup_steps 1 --prompt "Bumblebee from transformers"
+
+Profiling results will be saved to profiling_results/. Generated Images will be saved to results/.
 
 ---
 
