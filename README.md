@@ -22,7 +22,12 @@
     cd uccl
     bash build_and_install.sh rocm6 p2p 3.14
 
-### 5. Export Environment Variables
+### 5. Set Up xDiT (on any node)
+
+    cd xDiT
+    pip3 install -e .
+
+### 6. Export Environment Variables
 
 #### Node 0
 
@@ -44,7 +49,7 @@
 
 You can toggle ENABLE_P2P_PROFILING based on whether you want profiling enabled.
 
-### 6. Test with 8 GPUs/Node on 2 Nodes (Profiling Enabled)
+### 7. Test with 8 GPUs/Node on 2 Nodes (Profiling Enabled)
 
 #### Node 0 Command
 
